@@ -1,0 +1,20 @@
+# Competition data and generated outputs must not be committed.
+.deps/
+data/raw/
+data/processed/
+outputs/
+runs/
+*.parquet
+*.gz
+*.zip
+*.7z
+*.rar
+
+# Local Python files.
+__pycache__/
+*.py[cod]
+.venv/
+
+# Keep the small submission template, source code, configuration and docs.
+!data/templates/
+!data/templates/**
