@@ -431,7 +431,7 @@ $pythonA = Join-Path $env:USERPROFILE '.cache/codex-runtimes/codex-primary-runti
 
 #### 6.1.3 已交付数据及使用方式
 
-GitHub数据交付：[member-a-v1.0 Release](https://github.com/m926y/IE-competition/releases/tag/member-a-v1.0)。下载附件 `member-a-features-v1.zip`，在项目根目录解压，恢复 `outputs/features/` 和本次 `runs/member_a/20260922_110414/`。下表中的本地数据链接在解压后有效；数据未提交到Git历史。仅使用已计算特征无需原始数据，重新运行流水线仍需另行准备公共清洗层。
+数据交付包为 `member-a-features-v1.zip`，当前保留在交付者本地，尚未公开上传。获得数据包后，在项目根目录解压，恢复 `outputs/features/` 和本次 `runs/member_a/20260922_110414/`。下表中的本地数据链接在解压后有效；数据未提交到Git历史。仅使用已计算特征无需原始数据，重新运行流水线仍需另行准备公共清洗层。
 
 | 产物（均位于outputs/features） | 本次结果 / 用途 |
 |---|---|
