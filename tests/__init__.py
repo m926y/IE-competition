@@ -1,1 +1,1 @@
-"""Project test suite."""
+"""Integrated project tests."""
