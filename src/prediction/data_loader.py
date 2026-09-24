@@ -13,7 +13,8 @@ ID_COLUMN = "gpsno"
 LABEL_COLUMN = "label"
 WINDOW_COLUMN = "window_id"
 DATE_COLUMNS = ("feature_start", "feature_end", "label_start", "label_end")
-METADATA_COLUMNS = {ID_COLUMN, LABEL_COLUMN, WINDOW_COLUMN, *DATE_COLUMNS}
+METADATA_COLUMNS = {ID_COLUMN, LABEL_COLUMN, WINDOW_COLUMN, *DATE_COLUMNS,
+    'accident_label', 'near_miss_label', 'window_role', 'feature_window_days', 'label_horizon_days'}
 EXACT_LEAKAGE_COLUMNS = {
     "target",
     "future_target",
@@ -99,8 +100,7 @@ def select_feature_columns(frame: pd.DataFrame) -> list[str]:
     all_missing = [column for column in features if frame[column].isna().all()]
     if all_missing:
         raise ValueError(f"存在全空特征：{all_missing}")
-    constant = [column for column in features if frame[column].nunique(dropna=False) <= 1]
-    return [column for column in features if column not in constant]
+    return features  # Selection belongs to the training fold / A's frozen core contract.
 
 
 def align_prediction_features(
@@ -111,7 +111,7 @@ def align_prediction_features(
     columns = list(feature_columns)
     for column in columns:
         if column not in result.columns:
-            result[column] = np.nan
+            raise ValueError(f'Prediction features missing required column: {column}')
     return result[[ID_COLUMN, *columns]]
 
 

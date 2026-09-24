@@ -68,7 +68,7 @@ def validate_outputs(con, train, full, registry, core, windows, split_rows, prof
     assert valid['label_end']<test['label_start']
     # Independent SQL label reconstruction, rather than trusting the label builder.
     for w in windows:
-        expected=dict(con.execute(f"SELECT gpsno, max(CASE WHEN event_type IN (11803,11804) THEN 1 ELSE 0 END) FROM risk_events WHERE event_time >= TIMESTAMP '{w.end+DAY}' AND event_time < TIMESTAMP '{w.end+(w.horizon+1)*DAY}' GROUP BY gpsno").fetchall())
+        expected=dict(con.execute(f"SELECT gpsno, CAST(sum(CASE WHEN event_type=11803 THEN 1 ELSE 0 END)>=1 OR sum(CASE WHEN event_type=11804 THEN 1 ELSE 0 END)>=2 AS INTEGER) FROM risk_events WHERE event_time >= TIMESTAMP '{w.end+DAY}' AND event_time < TIMESTAMP '{w.end+(w.horizon+1)*DAY}' GROUP BY gpsno").fetchall())
         assert all(r['label']==expected.get(r['gpsno'],0) for r in train if r['window_id']==w.id)
     assert con.execute('SELECT sum(total_count) FROM risk_daily').fetchone()[0]==con.execute('SELECT count(*) FROM risk_events').fetchone()[0]
     return dict(status='passed', train_rows=len(train), final_rows=len(full),

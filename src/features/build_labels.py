@@ -3,7 +3,7 @@ from .window_definitions import DAY
 def build_labels(con, window):
     """Recorded-event labels. Missing event is not proof of event ascertainment."""
     rows = con.execute(f"""SELECT p.gpsno,
-        CAST(coalesce(count_if(r.event_type IN (11803,11804)),0)>0 AS INTEGER) AS "label",
+        CAST(coalesce(count_if(r.event_type=11803),0)>=1 OR coalesce(count_if(r.event_type=11804),0)>=2 AS INTEGER) AS "label",
         CAST(coalesce(count_if(r.event_type=11803),0)>0 AS INTEGER) accident_label,
         CAST(coalesce(count_if(r.event_type=11804),0)>0 AS INTEGER) near_miss_label
         FROM profile p LEFT JOIN risk_events r ON p.gpsno=r.gpsno

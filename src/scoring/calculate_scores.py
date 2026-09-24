@@ -57,7 +57,13 @@ def resolve_inputs(cleaned_dir: Path) -> dict[str, Path]:
     return paths
 
 
-def collect_cleaned_frames(paths: dict[str, Path], rules: pd.DataFrame, as_of_ts: str = AS_OF_TS):
+def collect_cleaned_frames(paths: dict[str, Path], rules: pd.DataFrame, as_of_ts: str = AS_OF_TS,
+                           start_date: str = '2026-06-01'):
+    cutoff=pd.Timestamp(as_of_ts)
+    if cutoff.time().isoformat() != '23:59:59':
+        raise ValueError('Daily sensor aggregates require an end-of-day cutoff 23:59:59')
+    if pd.Timestamp(start_date)>cutoff:
+        raise ValueError('start_date must not exceed as_of')
     if duckdb is None:
         raise RuntimeError("缺少DuckDB。请执行：python -m pip install -r src/scoring/requirements.txt")
     connection = duckdb.connect()
@@ -69,6 +75,7 @@ def collect_cleaned_frames(paths: dict[str, Path], rules: pd.DataFrame, as_of_ts
         trajectory = connection.execute(f"""
             SELECT gpsno,
                    count(*) AS trajectory_days,
+                   count_if(moving_rows > 0) AS active_days,
                    sum(source_rows) AS trajectory_source_rows,
                    sum(valid_speed_rows) AS valid_speed_rows,
                    sum(invalid_speed_rows) AS invalid_speed_rows,
@@ -77,6 +84,7 @@ def collect_cleaned_frames(paths: dict[str, Path], rules: pd.DataFrame, as_of_ts
                    sum(distance_km) AS distance_km,
                    sum(run_time_hours) AS run_time_hours
             FROM read_parquet({_sql_quote(paths['trajectory'])})
+            WHERE event_date BETWEEN CAST({_sql_quote(start_date)} AS DATE) AND CAST({_sql_quote(as_of_ts)} AS DATE)
             GROUP BY gpsno
         """).df()
         imu = connection.execute(f"""
@@ -87,9 +95,9 @@ def collect_cleaned_frames(paths: dict[str, Path], rules: pd.DataFrame, as_of_ts
                    sum(missing_gps_speed_rows) AS missing_gps_speed_rows,
                    sum(accel_norm_outlier_rows) AS accel_norm_outlier_rows,
                    sum(gyro_norm_gt20_rows) AS gyro_norm_gt20_rows,
-                   sum(coalesce(ems_gps_abs_diff_mean, 0) * source_rows)
-                     / nullif(sum(source_rows), 0) AS ems_gps_abs_diff_mean
+                   avg(ems_gps_abs_diff_mean) AS ems_gps_abs_diff_mean
             FROM read_parquet({_sql_quote(paths['imu'])})
+            WHERE event_date BETWEEN CAST({_sql_quote(start_date)} AS DATE) AND CAST({_sql_quote(as_of_ts)} AS DATE)
             GROUP BY gpsno
         """).df()
         risk = connection.execute(f"""
@@ -104,6 +112,7 @@ def collect_cleaned_frames(paths: dict[str, Path], rules: pd.DataFrame, as_of_ts
               JOIN scoring_rules AS rules
                 ON events.event_type = cast(rules.event_type AS INTEGER)
               WHERE events.event_time <= TIMESTAMP {_sql_quote(as_of_ts)}
+                AND events.event_time >= TIMESTAMP {_sql_quote(start_date)}
             )
             SELECT gpsno, dimension,
                    count(*) AS event_count,
@@ -140,6 +149,8 @@ def score_frames(
     imu: pd.DataFrame,
     risk: pd.DataFrame,
     weights: dict[str, float] | None = None,
+    reference: dict | None = None,
+    observation_days: int = OBSERVATION_DAYS,
 ) -> tuple[pd.DataFrame, dict[str, float], dict]:
     """Score already aggregated frames; separated for deterministic unit tests."""
     if profile["gpsno"].duplicated().any():
@@ -147,6 +158,7 @@ def score_frames(
     frame = profile.copy()
     frame["gpsno"] = frame["gpsno"].astype(str)
     frame = frame.merge(trajectory, on="gpsno", how="left").merge(imu, on="gpsno", how="left")
+    speed_difference_available = frame.get('ems_gps_abs_diff_mean', pd.Series(np.nan,index=frame.index)).notna()
     numeric_fill = [
         "trajectory_days", "trajectory_source_rows", "valid_speed_rows", "invalid_speed_rows",
         "valid_coordinate_rows", "invalid_coordinate_rows", "distance_km", "run_time_hours",
@@ -169,15 +181,18 @@ def score_frames(
         elif dimension == "fatigue_distraction":
             exposure = frame["run_time_hours"] / 100.0
         else:
-            exposure = frame["trajectory_days"].astype(float)
+            exposure = frame.get('active_days', frame['trajectory_days']).astype(float)
         frame[f"{dimension}_exposure"] = exposure
         rate, prior_mean, prior_exposure = empirical_bayes_rate(
-            frame[f"{dimension}_decayed_severity_count"], exposure
+            frame[f"{dimension}_decayed_severity_count"], exposure,
+            tau=None if reference is None else reference[dimension]['tau'],
+            prior_mean=None if reference is None else reference[dimension]['mu'],
         )
         frame[f"{dimension}_rate"] = rate
         frame[f"{dimension}_prior_mean"] = prior_mean
         frame[f"{dimension}_prior_exposure"] = prior_exposure
-        frame[f"{dimension}_penalty"] = monotone_percentile_penalty(rate).to_numpy()
+        frame[f"{dimension}_penalty"] = monotone_percentile_penalty(rate,
+            reference_rate=None if reference is None else reference[dimension]['rates']).to_numpy()
 
     imu_available = frame["imu_source_rows"] > 0
     imu_rate = pd.Series(np.nan, index=frame.index, dtype="float64")
@@ -185,14 +200,15 @@ def score_frames(
         0.60 * frame.loc[imu_available, "accel_norm_outlier_rows"] / frame.loc[imu_available, "imu_source_rows"]
         + 0.30 * frame.loc[imu_available, "gyro_norm_gt20_rows"] / frame.loc[imu_available, "imu_source_rows"]
         + 0.10 * (frame.loc[imu_available, "ems_gps_abs_diff_mean"] / 20.0).clip(0, 1)
-    )
+    ) / (0.90 + 0.10 * speed_difference_available.loc[imu_available].astype(float))
     frame["imu_evidence_event_count"] = (
         frame["accel_norm_outlier_rows"] + frame["gyro_norm_gt20_rows"]
     ).fillna(0).astype(int)
     frame["imu_evidence_exposure"] = frame["imu_source_rows"]
     frame["imu_evidence_rate"] = imu_rate
     frame["imu_evidence_penalty"] = monotone_percentile_penalty(
-        imu_rate, available=imu_available, cap=60.0
+        imu_rate, available=imu_available, cap=60.0,
+        reference_rate=None if reference is None else reference['imu_evidence']['rates']
     ).to_numpy()
 
     calibration = {
@@ -216,8 +232,8 @@ def score_frames(
     frame["valid_speed_ratio"] = (frame["valid_speed_rows"] / trajectory_rows).fillna(0.0).clip(0, 1)
     frame["valid_coordinate_ratio"] = (frame["valid_coordinate_rows"] / trajectory_rows).fillna(0.0).clip(0, 1)
     frame["confidence_score"] = (
-        25 * (frame["trajectory_days"] / OBSERVATION_DAYS).clip(0, 1)
-        + 15 * (frame["imu_days"] / OBSERVATION_DAYS).clip(0, 1)
+        25 * (frame["trajectory_days"] / observation_days).clip(0, 1)
+        + 15 * (frame["imu_days"] / observation_days).clip(0, 1)
         + 15 * frame["valid_speed_ratio"]
         + 15 * frame["valid_coordinate_ratio"]
         + 10 * (frame["distance_km"] / 1000.0).clip(0, 1)
@@ -276,6 +292,7 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR)
     parser.add_argument("--as-of", default=AS_OF_TS)
+    parser.add_argument('--start-date', default='2026-06-01')
     args = parser.parse_args()
 
     started = time.time()
@@ -285,8 +302,9 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     run_dir.mkdir(parents=True, exist_ok=True)
     rules = default_rules_frame()
-    profile, trajectory, imu, risk, quality = collect_cleaned_frames(paths, rules, args.as_of)
-    details, weights, calibration = score_frames(profile, trajectory, imu, risk)
+    profile, trajectory, imu, risk, quality = collect_cleaned_frames(paths, rules, args.as_of,args.start_date)
+    days=(pd.Timestamp(args.as_of).normalize()-pd.Timestamp(args.start_date)).days+1
+    details, weights, calibration = score_frames(profile, trajectory, imu, risk,observation_days=days)
     validation = validate_score_frame(details, weights, calibration)
 
     write_csv(details, output_dir / "safety_scores.csv", SAFETY_SCORE_COLUMNS)

@@ -103,7 +103,7 @@ def run(cleaned, output, overwrite=False):
     quality['warnings']=[
         'Main 21->40 sample is diagnostic; no earlier complete 14+14 training sample exists by June 21.',
         '14-day probability is not a calibrated 40-day probability; B must document horizon transfer.',
-        'Profile summary cutoff is unknown; all profile snapshot fields excluded from strict core.',
+        'Profile summary ends July 31; excluded from early backtests to prevent future leakage.',
         'IMU daily means/stds are equal-weight summaries across observed days; valid per-axis sample counts unavailable.',
         'Absence of recorded risk events defines the provided label, not verified accident-free surveillance.',
         'Calendar gaps do not imply stopped driving; no missing trajectory or IMU values filled with zero.',
@@ -126,9 +126,9 @@ def run(cleaned, output, overwrite=False):
                excluded_columns=selector.reasons,forbidden='gpsno, all date/window metadata, all label columns',
                missing_policy='Keep NULL. Imputer/scaler/shrinkage must fit inside each B training fold.'))
     main=next(r for r in label_summaries if r['window_role']=='main_40d')
-    assert main['positive']==128,'Main label differs from previously audited count'
+    assert main['positive']==55,'Main label differs from QA-corrected independent count'
     write_json(stage/'label_report.json',dict(windows=label_summaries,main_positive_check=main['positive'],
-               definition='event_type in (11803,11804) within inclusive label dates; SQL uses half-open timestamps',
+               definition='count(11803)>=1 OR count(11804)>=2; QA 2026-09-23; half-open timestamps',
                local_test='2026-07-18..2026-07-31; feature cutoff 2026-07-17',
                validation='2026-07-01..2026-07-14; feature cutoff 2026-06-30',
                final_forecast='2026-08-01..2026-09-09 (40 days); labels unavailable',

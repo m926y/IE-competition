@@ -204,7 +204,10 @@ python -m src.prediction.validate_submission outputs/prediction/forecast_result.
 
 
 def run(args: argparse.Namespace) -> dict:
+    """Legacy synthetic-test harness; formal A inputs must use integrated.run."""
     train = load_training_data(args.train_features)
+    if 'window_role' in train:
+        raise ValueError('Use src.prediction.integrated for formal A feature contracts')
     full = load_prediction_data(args.full_features)
     features = select_feature_columns(train)
     aligned_full = align_prediction_features(full, features)
@@ -355,34 +358,12 @@ def run(args: argparse.Namespace) -> dict:
     return metrics
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="训练任务一事故预测模型并生成提交文件")
-    parser.add_argument("--train-features", type=Path, default=DEFAULT_TRAIN)
-    parser.add_argument("--full-features", type=Path, default=DEFAULT_FULL)
-    parser.add_argument("--feature-dictionary", type=Path, default=DEFAULT_DICTIONARY)
-    parser.add_argument("--expected-ids", type=Path, default=DEFAULT_EXPECTED_IDS)
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--random-state", type=int, default=DEFAULT_SEED)
-    parser.add_argument("--min-train-windows", type=int, default=1)
-    parser.add_argument("--skip-ablation", action="store_true")
-    return parser
-
-
 def main() -> None:
-    args = build_parser().parse_args()
-    try:
-        metrics = run(args)
-    except FileNotFoundError as exc:
-        raise SystemExit(
-            f"{exc}\n队员B需要队员A先交付 train_windows.parquet、"
-            "full_61d_features.parquet 和 feature_dictionary.csv。"
-        ) from exc
-    selected = metrics["selected_strategy"]
-    print(
-        f"完成：strategy={selected['name']}, "
-        f"mean_auc={selected['summary']['mean_roc_auc']:.6f}, "
-        f"output={args.output_dir}"
-    )
+    parser = argparse.ArgumentParser(description="QA-compliant fixed-window prediction pipeline")
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
+    args = parser.parse_args()
+    from .integrated import run as run_integrated
+    run_integrated(args.output_dir)
 
 
 if __name__ == "__main__":

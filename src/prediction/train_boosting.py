@@ -55,6 +55,7 @@ def _model(params: dict, random_state: int, n_estimators: int = 1200) -> LGBMCla
         n_jobs=-1,
         deterministic=True,
         force_col_wise=True,
+        subsample_freq=1,
         verbosity=-1,
         **params,
     )

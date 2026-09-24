@@ -1,4 +1,4 @@
-VERSION = 'member-a-v1.0'
+VERSION = 'member-a-v1.1-qa20260923'
 SEED = 20260922
 META_TYPES = {
     'gpsno': 'VARCHAR', 'window_id': 'VARCHAR', 'window_role': 'VARCHAR',

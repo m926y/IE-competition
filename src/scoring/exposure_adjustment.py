@@ -15,7 +15,7 @@ def decay_weight(age_days, half_life_days: float = 14.0):
     return np.power(2.0, -age / half_life_days)
 
 
-def empirical_bayes_rate(numerator, exposure, tau: float | None = None):
+def empirical_bayes_rate(numerator, exposure, tau: float | None = None, prior_mean=None):
     numerator = np.asarray(numerator, dtype=float)
     exposure = np.asarray(exposure, dtype=float)
     if numerator.shape != exposure.shape:
@@ -25,6 +25,8 @@ def empirical_bayes_rate(numerator, exposure, tau: float | None = None):
     valid = np.isfinite(numerator) & np.isfinite(exposure) & (exposure > 0)
     total_exposure = exposure[valid].sum()
     mu = float(numerator[valid].sum() / total_exposure) if total_exposure > 0 else 0.0
+    if prior_mean is not None:
+        mu = float(prior_mean)
     if tau is None:
         positive = exposure[valid]
         tau = float(np.median(positive)) if len(positive) else 1.0
@@ -45,7 +47,7 @@ def monotone_percentile_penalty(rate, available=None, cap: float = 100.0, refere
         return result
     observed = np.log1p(values[mask].clip(lower=0))
     if reference_rate is None:
-        result.loc[mask] = observed.rank(method="average", pct=True) * float(cap)
+        result.loc[mask] = (observed.rank(method="average") - 0.5) / len(observed) * float(cap)
         return result
     reference = pd.Series(reference_rate, dtype="float64").dropna().clip(lower=0)
     if reference.empty:

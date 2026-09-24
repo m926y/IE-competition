@@ -171,6 +171,13 @@ class SQLTests(unittest.TestCase):
             self.assertEqual(self.con.execute('SELECT count(*) FROM risk_daily').fetchone()[0],122)
             self.assertEqual(self.con.execute('SELECT sum(total_count),sum(fatigue_count),sum(hour_03_count) FROM risk_daily').fetchone(),(2,2,2))
 
+    def test_qa_requires_two_near_misses(self):
+        w=Window(START,date(2026,6,21),40)
+        self.add(11804,'2026-06-22 12:00:00')
+        self.assertEqual(build_labels(self.con,w)['001']['label'],0)
+        self.add(11804,'2026-06-22 12:01:00')
+        self.assertEqual(build_labels(self.con,w)['001']['label'],1)
+
     def test_short_warning_cutoff_and_future_mutation(self):
         w=Window(START,date(2026,6,14))
         self.add(11804,'2026-06-14 23:59:00')

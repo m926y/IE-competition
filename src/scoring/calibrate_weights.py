@@ -45,7 +45,6 @@ def _regularized_coefficients(penalties: pd.DataFrame, labels: pd.Series) -> dic
     x = penalties.loc[usable, columns].fillna(0.0).to_numpy(dtype=float) / 100.0
     y = labels.loc[usable].astype(int).to_numpy()
     model = LogisticRegression(
-        penalty="l2",
         C=0.1,
         class_weight="balanced",
         solver="liblinear",

@@ -14,6 +14,8 @@ runs/
 __pycache__/
 *.py[cod]
 .venv/
+docs/competition/dataset_description.pdf
+算法赛题答疑.pdf
 
 # Keep the small submission template, source code, configuration and docs.
 !data/templates/
