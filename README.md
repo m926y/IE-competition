@@ -17,12 +17,13 @@
 - 车辆画像标准化；
 - 轨迹日表与 IMU 日表合并；
 - 质量报告、清洗代码和团队协作结构。
+- 队员B事故预测代码、时间验证、模型融合、提交校验和自动化测试。
 
 尚未完成：
 
 - 时间标签和滚动训练样本；
 - 正式车辆级特征库；
-- 任务一预测模型；
+- 队员A正式特征交付后的任务一模型训练与最终预测结果；
 - 任务二安全评分结果；
 - 最终提交 CSV 和说明 PDF。
 
@@ -387,10 +388,19 @@ outputs/prediction/
 ├─ validation_metrics.json
 ├─ oof_predictions.parquet
 ├─ feature_importance.csv
+├─ ablation_results.csv
 ├─ model/
 ├─ forecast_result.csv
 └─ prediction_method.md
 ```
+
+B模块已经实现并通过合成时间窗口端到端测试。A交付正式特征后执行：
+
+```powershell
+.venv\Scripts\python.exe -m src.prediction.train_final
+```
+
+快速联调可添加`--skip-ablation`，正式结果必须运行完整特征族消融。详细输入契约与测试命令见`src/prediction/README.md`。
 
 提交CSV要求：
 
