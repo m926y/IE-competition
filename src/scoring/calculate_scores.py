@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import platform
 import time
@@ -18,7 +19,7 @@ try:
 except ImportError:  # pragma: no cover - score_frames itself does not need DuckDB
     duckdb = None
 
-from .calibrate_weights import calibrate_weights
+from .calibrate_weights import apply_penalty_model, calibrate_weights, fit_penalty_model
 from .event_taxonomy import DIMENSION_LABELS
 from .exposure_adjustment import empirical_bayes_rate, monotone_percentile_penalty
 from .export_scores import SAFETY_SCORE_COLUMNS, write_csv, write_json, write_parquet
@@ -30,6 +31,7 @@ ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CLEANED_DIR = ROOT / "data" / "processed" / "cleaned"
 DEFAULT_OUTPUT_DIR = ROOT / "outputs" / "scoring"
 DEFAULT_RUN_DIR = ROOT / "runs" / "member_c"
+DEFAULT_FEATURE_DIR = ROOT / "outputs" / "features"
 AS_OF_TS = "2026-07-31 23:59:59"
 OBSERVATION_DAYS = 61
 RANDOM_SEED = 20260923
@@ -39,6 +41,15 @@ REQUIRED_INPUTS = {
     "risk": "risk_events.parquet",
     "trajectory": "trajectory_daily.parquet",
     "imu": "imu_daily.parquet",
+}
+
+A_REQUIRED_INPUTS = {
+    "risk_daily": "risk_event_daily.parquet",
+    "train_windows": "train_windows.parquet",
+    "full_features": "full_61d_features.parquet",
+    "feature_dictionary": "feature_dictionary.csv",
+    "label_report": "label_report.json",
+    "split_manifest": "split_manifest.csv",
 }
 
 
@@ -268,33 +279,301 @@ def score_frames(
     return frame, weights, calibration
 
 
+def resolve_a_inputs(feature_dir: Path) -> dict[str, Path]:
+    paths = {key: feature_dir / filename for key, filename in A_REQUIRED_INPUTS.items()}
+    missing = [str(path) for path in paths.values() if not path.exists()]
+    if missing:
+        raise FileNotFoundError("A成员交付不完整：" + ", ".join(missing))
+    return paths
+
+
+def _read_parquet(path: Path) -> pd.DataFrame:
+    connection = duckdb.connect()
+    try:
+        return connection.execute(
+            f"SELECT * FROM read_parquet({_sql_quote(path)})"
+        ).df()
+    finally:
+        connection.close()
+
+
+def build_a_scoring_rows(base: pd.DataFrame, rules: pd.DataFrame, suffix: str) -> pd.DataFrame:
+    """Convert A's fixed-window feature contract into C's scoring contract."""
+    rows = pd.DataFrame(index=base.index)
+    rows["gpsno"] = base["gpsno"].astype(str)
+    for column in [
+        "window_id", "window_role", "feature_start", "feature_end",
+        "label_start", "label_end", "label",
+    ]:
+        if column in base:
+            rows[column] = base[column]
+    field_map = {
+        "energy_type": "profile_energy_type",
+        "distance_km": f"distance_km_{suffix}",
+        "run_time_hours": f"run_time_hours_{suffix}",
+        "trajectory_days": f"trajectory_days_{suffix}",
+        "imu_days": f"imu_days_{suffix}",
+        "valid_speed_ratio": f"speed_valid_fraction_{suffix}",
+        "valid_coordinate_ratio": f"coordinate_valid_fraction_{suffix}",
+        "active_days": f"active_days_{suffix}",
+    }
+    for target, source in field_map.items():
+        rows[target] = pd.to_numeric(base[source], errors="coerce") if target != "energy_type" else base[source]
+    rows["energy_type"] = rows["energy_type"].fillna("unknown").astype(str)
+
+    for dimension in [key for key in DIMENSION_LABELS if key != "imu_evidence"]:
+        dimension_rules = rules[rules["dimension"] == dimension]
+        count = pd.Series(0.0, index=base.index)
+        weighted = pd.Series(0.0, index=base.index)
+        for rule in dimension_rules.itertuples(index=False):
+            code = int(rule.event_type)
+            count = count.add(pd.to_numeric(base[f"evt_{code}_count_{suffix}"], errors="coerce").fillna(0.0))
+            weighted = weighted.add(
+                pd.to_numeric(base[f"evt_{code}_decayed_count_{suffix}"], errors="coerce").fillna(0.0)
+                * float(rule.severity)
+            )
+        rows[f"{dimension}_event_count"] = count.round().astype(int)
+        rows[f"{dimension}_decayed_severity_count"] = weighted
+        if dimension in {"history", "driving_stability", "road_rule"}:
+            rows[f"{dimension}_exposure"] = rows["distance_km"] / 1000.0
+        elif dimension == "fatigue_distraction":
+            rows[f"{dimension}_exposure"] = rows["run_time_hours"] / 100.0
+        else:
+            rows[f"{dimension}_exposure"] = rows["active_days"]
+
+    accel = pd.to_numeric(base[f"imu_accel_outlier_fraction_{suffix}"], errors="coerce")
+    gyro = pd.to_numeric(base[f"imu_gyro_gt20_fraction_{suffix}"], errors="coerce")
+    speed_gap = pd.to_numeric(
+        base[f"imu_ems_gps_abs_diff_mean_daily_mean_{suffix}"], errors="coerce"
+    )
+    imu_available = rows["imu_days"].fillna(0) > 0
+    rows["imu_evidence_raw_rate"] = (
+        0.60 * accel + 0.30 * gyro + 0.10 * (speed_gap / 20.0).clip(0, 1)
+    ).where(imu_available)
+    rows["imu_evidence_event_count"] = 0
+    rows["imu_evidence_exposure"] = rows["imu_days"].fillna(0)
+    return rows
+
+
+def finalize_a_scores(
+    rows: pd.DataFrame,
+    weights: dict[str, float],
+    observation_days: int = 14,
+) -> pd.DataFrame:
+    """Create score, explanation and action columns after frozen transforms are applied."""
+    validate_weights(weights)
+    frame = rows.copy()
+    for dimension, weight in weights.items():
+        frame[f"{dimension}_weight"] = weight
+        frame[f"{dimension}_contribution"] = weight * frame[f"{dimension}_penalty"].fillna(0.0)
+    frame["safety_score_raw"] = 100.0 - sum(
+        frame[f"{dimension}_contribution"] for dimension in weights
+    )
+    frame["safety_score"] = frame["safety_score_raw"].clip(0, 100)
+    frame = frame.sort_values(["safety_score", "gpsno"], ascending=[False, True]).reset_index(drop=True)
+    frame["rank"] = np.arange(1, len(frame) + 1)
+    frame["risk_level"] = _assign_risk_level(frame["rank"])
+    frame["valid_speed_ratio"] = frame["valid_speed_ratio"].fillna(0.0).clip(0, 1)
+    frame["valid_coordinate_ratio"] = frame["valid_coordinate_ratio"].fillna(0.0).clip(0, 1)
+    frame["confidence_score"] = (
+        25 * (frame["trajectory_days"].fillna(0) / observation_days).clip(0, 1)
+        + 15 * (frame["imu_days"].fillna(0) / observation_days).clip(0, 1)
+        + 15 * frame["valid_speed_ratio"]
+        + 15 * frame["valid_coordinate_ratio"]
+        + 10 * (frame["distance_km"].fillna(0) / 1000.0).clip(0, 1)
+        + 10 * (frame["run_time_hours"].fillna(0) / 100.0).clip(0, 1)
+        + 10
+    ).clip(0, 100)
+    frame["confidence_level"] = np.select(
+        [frame["confidence_score"] >= 80, frame["confidence_score"] >= 60],
+        ["high", "medium"], default="low",
+    )
+    for index in range(1, 4):
+        for ending, default in [
+            ("", ""), ("_code", ""), ("_dimension", ""),
+            ("_penalty_points", np.nan), ("_event_count", np.nan),
+            ("_normalized_rate", np.nan), ("_percentile", np.nan),
+        ]:
+            frame[f"top_reason_{index}{ending}"] = default
+    frame["primary_risk_dimension"] = ""
+    frame["primary_risk_dimension_name"] = ""
+    for row_index, row in frame.iterrows():
+        candidates = [
+            dimension for dimension in weights if pd.notna(row[f"{dimension}_penalty"])
+        ]
+        top_dimensions = sorted(
+            candidates, key=lambda key: (-row[f"{key}_contribution"], key)
+        )[:3]
+        for reason_rank, dimension in enumerate(top_dimensions, start=1):
+            record = reason_record(row, dimension, reason_rank)
+            frame.at[row_index, f"top_reason_{reason_rank}"] = record["reason_text"]
+            frame.at[row_index, f"top_reason_{reason_rank}_code"] = record["reason_code"]
+            frame.at[row_index, f"top_reason_{reason_rank}_dimension"] = record["dimension"]
+            frame.at[row_index, f"top_reason_{reason_rank}_penalty_points"] = record["penalty_points"]
+            frame.at[row_index, f"top_reason_{reason_rank}_event_count"] = record["event_count"]
+            frame.at[row_index, f"top_reason_{reason_rank}_normalized_rate"] = record["normalized_rate"]
+            frame.at[row_index, f"top_reason_{reason_rank}_percentile"] = record["comparison_percentile"]
+        frame.at[row_index, "primary_risk_dimension"] = top_dimensions[0]
+        frame.at[row_index, "primary_risk_dimension_name"] = DIMENSION_LABELS[top_dimensions[0]]
+    actions = frame.apply(
+        lambda row: operational_action(
+            row["risk_level"], row["primary_risk_dimension"], row["confidence_level"],
+            int(row[f"{row['primary_risk_dimension']}_event_count"]),
+        ),
+        axis=1,
+        result_type="expand",
+    )
+    frame = pd.concat([frame, actions], axis=1)
+    frame["safety_score"] = frame["safety_score"].round(4)
+    frame["confidence_score"] = frame["confidence_score"].round(2)
+    return frame
+
+
+def _future_labels(details: pd.DataFrame, source: pd.DataFrame) -> pd.Series:
+    label_map = source.assign(gpsno=source["gpsno"].astype(str)).set_index("gpsno")["label"]
+    return details["gpsno"].map(label_map)
+
+
+def run_a_integrated_scoring(
+    paths: dict[str, Path], rules: pd.DataFrame
+) -> tuple[pd.DataFrame, dict[str, float], dict, dict, dict]:
+    train_windows = _read_parquet(paths["train_windows"])
+    full_features = _read_parquet(paths["full_features"])
+    split_manifest = pd.read_csv(paths["split_manifest"])
+
+    selection_train_id = split_manifest.query(
+        "phase == 'model_selection' and split_role == 'train'"
+    )["window_id"].iloc[0]
+    selection_validation_id = split_manifest.query(
+        "phase == 'model_selection' and split_role == 'validation'"
+    )["window_id"].iloc[0]
+    locked_train_ids = split_manifest.query(
+        "phase == 'locked_test' and split_role == 'train'"
+    )["window_id"].tolist()
+    locked_test_id = split_manifest.query(
+        "phase == 'locked_test' and split_role == 'test'"
+    )["window_id"].iloc[0]
+
+    def window_rows(window_ids: list[str]) -> pd.DataFrame:
+        selected = train_windows[train_windows["window_id"].isin(window_ids)].copy()
+        return build_a_scoring_rows(selected, rules, "window")
+
+    selection_train = window_rows([selection_train_id])
+    selection_model, selection_train = fit_penalty_model(selection_train)
+    selection_weights, selection_calibration = calibrate_weights(
+        selection_train,
+        selection_train["label"],
+        selection_train["window_id"],
+    )
+    selection_validation_raw = window_rows([selection_validation_id])
+    selection_validation = finalize_a_scores(
+        apply_penalty_model(selection_validation_raw, selection_model), selection_weights
+    )
+    selection_report = validate_score_frame(
+        selection_validation,
+        selection_weights,
+        selection_calibration,
+        _future_labels(selection_validation, selection_validation_raw),
+    )
+
+    locked_train = window_rows(locked_train_ids)
+    penalty_model, locked_train = fit_penalty_model(locked_train)
+    weights, calibration = calibrate_weights(
+        locked_train,
+        locked_train["label"],
+        locked_train["window_id"],
+    )
+    locked_test_raw = window_rows([locked_test_id])
+    locked_test = finalize_a_scores(
+        apply_penalty_model(locked_test_raw, penalty_model), weights
+    )
+    locked_report = validate_score_frame(
+        locked_test,
+        weights,
+        calibration,
+        _future_labels(locked_test, locked_test_raw),
+    )
+
+    main_raw_base = train_windows[train_windows["window_role"] == "main_40d"].copy()
+    main_raw = build_a_scoring_rows(main_raw_base, rules, "14d")
+    main_diagnostic = finalize_a_scores(apply_penalty_model(main_raw, penalty_model), weights)
+    main_report = validate_score_frame(
+        main_diagnostic,
+        weights,
+        calibration,
+        _future_labels(main_diagnostic, main_raw),
+    )
+
+    final_raw = build_a_scoring_rows(full_features, rules, "14d")
+    final_raw["window_id"] = "final_14d_20260731"
+    final_raw["window_role"] = "final_forecast"
+    final_raw["feature_start"] = "2026-07-18"
+    final_raw["feature_end"] = "2026-07-31"
+    details = finalize_a_scores(apply_penalty_model(final_raw, penalty_model), weights)
+    validation = validate_score_frame(details, weights, calibration)
+    validation["validation_scope"] = (
+        "A交付已接入；固定14天时间切分，锁定测试仅用于最终评估，"
+        "21→40天主窗口仅作诊断。"
+    )
+    validation["model_selection_validation"] = selection_report
+    validation["locked_test"] = locked_report
+    validation["main_40d_diagnostic"] = main_report
+    validation["overall_status"] = (
+        "pass"
+        if validation["overall_static_status"] == "pass"
+        and locked_report["overall_static_status"] == "pass"
+        and locked_report["future_validation"]["status"] == "pass"
+        else "review_required"
+    )
+    parameters = {
+        "selection_train_window": selection_train_id,
+        "selection_validation_window": selection_validation_id,
+        "selection_weights": selection_weights,
+        "selection_calibration": selection_calibration,
+        "locked_train_windows": locked_train_ids,
+        "locked_test_window": locked_test_id,
+        "final_weights": weights,
+        "final_calibration": calibration,
+        "penalty_model": penalty_model,
+    }
+    quality = {
+        "train_window_rows": int(len(train_windows)),
+        "train_window_vehicles": int(train_windows["gpsno"].nunique()),
+        "final_feature_rows": int(len(full_features)),
+        "final_feature_vehicles": int(full_features["gpsno"].nunique()),
+        "a_label_report": json.loads(paths["label_report"].read_text(encoding="utf-8")),
+    }
+    return details, weights, calibration, validation, {"parameters": parameters, "quality": quality}
+
+
 def main() -> None:
     if duckdb is None:
         raise SystemExit("缺少DuckDB。请执行：python -m pip install -r src/scoring/requirements.txt")
     parser = argparse.ArgumentParser(description="生成成员C的安全评分、解释、运营动作和验证报告")
     parser.add_argument("--cleaned-dir", type=Path, default=DEFAULT_CLEANED_DIR)
+    parser.add_argument("--feature-dir", type=Path, default=DEFAULT_FEATURE_DIR)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR)
     parser.add_argument("--as-of", default=AS_OF_TS)
     args = parser.parse_args()
 
     started = time.time()
-    paths = resolve_inputs(args.cleaned_dir.resolve())
+    paths = resolve_a_inputs(args.feature_dir.resolve())
     output_dir = args.output_dir.resolve()
     run_dir = args.run_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     run_dir.mkdir(parents=True, exist_ok=True)
     rules = default_rules_frame()
-    profile, trajectory, imu, risk, quality = collect_cleaned_frames(paths, rules, args.as_of)
-    details, weights, calibration = score_frames(profile, trajectory, imu, risk)
-    validation = validate_score_frame(details, weights, calibration)
+    details, weights, calibration, validation, audit = run_a_integrated_scoring(paths, rules)
+    quality = audit["quality"]
 
     write_csv(details, output_dir / "safety_scores.csv", SAFETY_SCORE_COLUMNS)
     write_parquet(details, output_dir / "score_details.parquet", duckdb)
     write_rules(output_dir / "scoring_rules.csv", rules)
     write_json(validation, output_dir / "score_validation.json")
+    write_json(audit["parameters"], run_dir / "calibration_parameters.json")
     manifest = {
-        "run_id": "member_c_pre_a_v1_1",
+        "run_id": "member_c_a_integrated_v2_0",
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "as_of_timestamp": args.as_of,
         "random_seed": RANDOM_SEED,
@@ -308,12 +587,12 @@ def main() -> None:
             "score_validation.json", "scoring_method.md",
         ],
         "elapsed_seconds": round(time.time() - started, 2),
-        "validation_status": validation["overall_static_status"],
+        "validation_status": validation["overall_status"],
     }
     write_json(manifest, run_dir / "run_manifest.json")
     print(
         f"完成：{len(details)}辆车；静态验证={validation['overall_static_status']}；"
-        f"未来标签验证={validation['future_validation']['status']}；"
+        f"锁定测试={validation['locked_test']['future_validation']['status']}；"
         f"耗时={manifest['elapsed_seconds']}秒"
     )
 

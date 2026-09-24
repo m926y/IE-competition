@@ -8,7 +8,7 @@ import pandas as pd
 
 from .event_taxonomy import DIMENSION_LABELS, EVENT_TAXONOMY, EXPECTED_EVENT_CODES
 
-RULE_VERSION = "member_c_v1.1_pre_a"
+RULE_VERSION = "member_c_v2.0_a_integrated"
 HALF_LIFE_DAYS = 14.0
 
 DEFAULT_WEIGHTS = {

@@ -2,4 +2,4 @@
 
 每次正式运行在本目录生成 `run_manifest.json`，记录截止时间、随机种子、输入文件名、运行环境、权重、校准状态、质量摘要、输出清单、耗时和验证状态。
 
-真实运行记录和任何缓存都不提交到公开仓库，因为它们可能泄露比赛数据规模、文件信息或派生结果。`run_manifest.schema.json` 仅定义可复现字段，不包含真实数据。
+主分支仅跟踪 `run_manifest.schema.json`；真实 `run_manifest.json` 和 `calibration_parameters.json` 与评分结果一起放入 GitHub Release 附件，便于下载复核。

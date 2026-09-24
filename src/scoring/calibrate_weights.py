@@ -5,7 +5,81 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from .event_taxonomy import DIMENSION_LABELS
+from .exposure_adjustment import monotone_percentile_penalty
 from .scoring_rules import DEFAULT_WEIGHTS, validate_weights
+
+
+def fit_penalty_model(rows: pd.DataFrame) -> tuple[dict, pd.DataFrame]:
+    """Fit shrinkage and percentile references on training windows only."""
+    fitted = rows.copy()
+    model = {"dimensions": {}}
+    for dimension in DIMENSION_LABELS:
+        if dimension == "imu_evidence":
+            rate = pd.Series(fitted[f"{dimension}_raw_rate"], dtype="float64")
+            reference = sorted(float(value) for value in rate.dropna().clip(lower=0))
+            fitted[f"{dimension}_rate"] = rate
+            fitted[f"{dimension}_penalty"] = monotone_percentile_penalty(
+                rate, available=rate.notna(), cap=60.0, reference_rate=reference
+            ).to_numpy()
+            model["dimensions"][dimension] = {
+                "cap": 60.0,
+                "reference_rate": reference,
+            }
+            continue
+        numerator = pd.to_numeric(fitted[f"{dimension}_decayed_severity_count"], errors="coerce").fillna(0.0)
+        exposure = pd.to_numeric(fitted[f"{dimension}_exposure"], errors="coerce")
+        valid = exposure.notna() & (exposure > 0)
+        total_exposure = float(exposure[valid].sum())
+        prior_mean = float(numerator[valid].sum() / total_exposure) if total_exposure > 0 else 0.0
+        prior_exposure = float(exposure[valid].median()) if valid.any() else 1.0
+        prior_exposure = max(prior_exposure, 1e-9)
+        clean_exposure = exposure.fillna(0.0).clip(lower=0.0)
+        rate = (numerator + prior_exposure * prior_mean) / (clean_exposure + prior_exposure)
+        reference = sorted(float(value) for value in rate.dropna().clip(lower=0))
+        fitted[f"{dimension}_rate"] = rate
+        fitted[f"{dimension}_penalty"] = monotone_percentile_penalty(
+            rate, reference_rate=reference
+        ).to_numpy()
+        model["dimensions"][dimension] = {
+            "prior_mean": prior_mean,
+            "prior_exposure": prior_exposure,
+            "cap": 100.0,
+            "reference_rate": reference,
+        }
+    return model, fitted
+
+
+def apply_penalty_model(rows: pd.DataFrame, model: dict) -> pd.DataFrame:
+    """Apply training-only shrinkage and percentile references to later data."""
+    transformed = rows.copy()
+    for dimension in DIMENSION_LABELS:
+        parameters = model["dimensions"][dimension]
+        if dimension == "imu_evidence":
+            rate = pd.Series(transformed[f"{dimension}_raw_rate"], dtype="float64")
+            transformed[f"{dimension}_rate"] = rate
+            transformed[f"{dimension}_penalty"] = monotone_percentile_penalty(
+                rate,
+                available=rate.notna(),
+                cap=float(parameters["cap"]),
+                reference_rate=parameters["reference_rate"],
+            ).to_numpy()
+            continue
+        numerator = pd.to_numeric(
+            transformed[f"{dimension}_decayed_severity_count"], errors="coerce"
+        ).fillna(0.0)
+        exposure = pd.to_numeric(transformed[f"{dimension}_exposure"], errors="coerce")
+        clean_exposure = exposure.fillna(0.0).clip(lower=0.0)
+        prior_mean = float(parameters["prior_mean"])
+        prior_exposure = float(parameters["prior_exposure"])
+        rate = (numerator + prior_exposure * prior_mean) / (clean_exposure + prior_exposure)
+        transformed[f"{dimension}_rate"] = rate
+        transformed[f"{dimension}_penalty"] = monotone_percentile_penalty(
+            rate,
+            cap=float(parameters["cap"]),
+            reference_rate=parameters["reference_rate"],
+        ).to_numpy()
+    return transformed
 
 
 def binary_auc(y_true, score) -> float | None:
