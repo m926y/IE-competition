@@ -8,7 +8,7 @@ import pandas as pd
 
 from .event_taxonomy import DIMENSION_LABELS, EVENT_TAXONOMY, EXPECTED_EVENT_CODES
 
-RULE_VERSION = "member_c_v2.0_a_integrated"
+RULE_VERSION = "member_c_v2.1_docs_complete"
 HALF_LIFE_DAYS = 14.0
 
 DEFAULT_WEIGHTS = {
@@ -38,6 +38,18 @@ EXPOSURE_UNIT = {
     "management": "per_active_day",
 }
 
+# Correlated alarms are aggregated inside one dimension and can never deduct
+# more than this dimension-level cap, regardless of how many related event
+# codes fire together. IMU remains a lower-weight corroborating signal.
+DIMENSION_PENALTY_CAPS = {
+    "history": 100.0,
+    "fatigue_distraction": 100.0,
+    "driving_stability": 100.0,
+    "road_rule": 100.0,
+    "management": 100.0,
+    "imu_evidence": 60.0,
+}
+
 
 def default_rules_frame() -> pd.DataFrame:
     rows = []
@@ -51,6 +63,7 @@ def default_rules_frame() -> pd.DataFrame:
             "severity": EVENT_SEVERITY[event_type],
             "exposure_unit": EXPOSURE_UNIT[dimension],
             "half_life_days": HALF_LIFE_DAYS,
+            "dimension_penalty_cap": DIMENSION_PENALTY_CAPS[dimension],
             "rule_version": RULE_VERSION,
         })
     return pd.DataFrame(rows)
@@ -59,7 +72,7 @@ def default_rules_frame() -> pd.DataFrame:
 def validate_rules(rules: pd.DataFrame) -> None:
     required = {
         "event_type", "event_name", "dimension", "severity",
-        "exposure_unit", "half_life_days", "rule_version",
+        "exposure_unit", "half_life_days", "dimension_penalty_cap", "rule_version",
     }
     missing = required - set(rules.columns)
     if missing:
@@ -71,6 +84,12 @@ def validate_rules(rules: pd.DataFrame) -> None:
         raise ValueError("事件严重度必须大于0")
     if (rules["half_life_days"].astype(float) <= 0).any():
         raise ValueError("半衰期必须大于0")
+    if not rules["dimension_penalty_cap"].astype(float).between(0, 100, inclusive="right").all():
+        raise ValueError("维度扣分上限必须在(0, 100]内")
+    for dimension, expected_cap in DIMENSION_PENALTY_CAPS.items():
+        observed = rules.loc[rules["dimension"] == dimension, "dimension_penalty_cap"].unique()
+        if dimension != "imu_evidence" and (len(observed) != 1 or observed[0] != expected_cap):
+            raise ValueError(f"{dimension}维度扣分上限不一致")
     if set(rules["dimension"]) - set(DIMENSION_LABELS):
         raise ValueError("存在未知评分维度")
 

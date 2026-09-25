@@ -5,5 +5,6 @@
 - `safety_scores.csv`
 - `score_details.parquet`
 - `score_validation.json`
+- `acceptance_report.json`
 
 这样既让 Git 主分支保持精简，又能在 GitHub 上下载完整可复现结果。

@@ -31,7 +31,7 @@ python -m src.scoring.calculate_scores
 
 ## 输出
 
-`outputs/scoring/` 生成最终排名、明细、规则和验证报告；`runs/member_c/` 生成运行清单和冻结的校准参数。由于仓库规则禁止直接提交数据派生文件，实际结果通过 GitHub Release 附件发布，源码、方法文档和规则表由 Git 跟踪。
+`outputs/scoring/` 生成最终排名、明细、规则、验证报告和对照 docs 的 `acceptance_report.json`；`runs/member_c/` 生成运行清单和冻结的校准参数。由于仓库规则禁止直接提交数据派生文件，实际结果通过 GitHub Release 附件发布，源码、方法文档和规则表由 Git 跟踪。
 
 ## 当前验证结论
 

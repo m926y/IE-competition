@@ -4,7 +4,12 @@ import numpy as np
 import pandas as pd
 
 from src.scoring.calibrate_weights import binary_auc, calibrate_weights
-from src.scoring.scoring_rules import DEFAULT_WEIGHTS, validate_weights
+from src.scoring.scoring_rules import (
+    DEFAULT_WEIGHTS,
+    DIMENSION_PENALTY_CAPS,
+    default_rules_frame,
+    validate_weights,
+)
 
 
 class ScoringRulesTest(unittest.TestCase):
@@ -23,6 +28,13 @@ class ScoringRulesTest(unittest.TestCase):
         bad["management"] = 0.04
         with self.assertRaises(ValueError):
             validate_weights(bad)
+
+    def test_correlated_event_dimensions_have_explicit_caps(self):
+        rules = default_rules_frame()
+        self.assertIn("dimension_penalty_cap", rules)
+        for dimension, group in rules.groupby("dimension"):
+            self.assertEqual(group.dimension_penalty_cap.nunique(), 1)
+            self.assertEqual(group.dimension_penalty_cap.iloc[0], DIMENSION_PENALTY_CAPS[dimension])
 
     def test_auc_handles_ties(self):
         self.assertAlmostEqual(binary_auc([0, 0, 1, 1], [0, 0.5, 0.5, 1]), 0.875)

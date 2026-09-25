@@ -22,6 +22,27 @@ TRAINING_TOPICS = {
     "imu_evidence": "平稳驾驶与车辆/传感器复核",
 }
 
+SOURCE_EVENT_CODES = {
+    "history": "11803,11804",
+    "fatigue_distraction": "41001,41002,41003,41004,41005,41009,41023,41029",
+    "driving_stability": "30000,30002,30003,30005,30017,60292,60294",
+    "road_rule": "11401,11402,11403,11405,11406",
+    "management": "41006,41021",
+    "imu_evidence": "",
+}
+
+SOURCE_FIELDS = {
+    "history": "evt_11803/11804_count_14d;distance_km_14d",
+    "fatigue_distraction": "evt_410xx_count_14d;run_time_hours_14d",
+    "driving_stability": "evt_300xx/6029x_count_14d;distance_km_14d",
+    "road_rule": "evt_114xx_count_14d;distance_km_14d",
+    "management": "evt_41006/41021_count_14d;active_days_14d",
+    "imu_evidence": (
+        "imu_accel_outlier_fraction_14d;imu_gyro_gt20_fraction_14d;"
+        "imu_ems_gps_abs_diff_mean_daily_mean_14d"
+    ),
+}
+
 
 def reason_record(row, dimension: str, rank: int) -> dict:
     label = DIMENSION_LABELS[dimension]
@@ -48,6 +69,8 @@ def reason_record(row, dimension: str, rank: int) -> dict:
         "event_count": count,
         "normalized_rate": round(rate, 6),
         "comparison_percentile": round(percentile, 2),
+        "source_event_codes": SOURCE_EVENT_CODES[dimension],
+        "source_fields": SOURCE_FIELDS[dimension],
     }
 
 

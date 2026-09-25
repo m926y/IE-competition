@@ -7,6 +7,9 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
+from .calibrate_weights import binary_auc
+from .event_taxonomy import DIMENSION_LABELS
+
 
 def _safe_float(value):
     return None if pd.isna(value) or not np.isfinite(value) else round(float(value), 6)
@@ -37,6 +40,34 @@ def _future_validation(details: pd.DataFrame, future_label: pd.Series | None) ->
     top = joined[joined["rank"] <= max(1, int(np.ceil(n * 0.20)))]["future_label"].mean()
     bottom = joined[joined["rank"] > int(np.floor(n * 0.80))]["future_label"].mean()
     monotonic = bool(level_rates.dropna().is_monotonic_increasing)
+    overall_auc = binary_auc(labels, 100.0 - details["safety_score"])
+    dimension_diagnostics = {}
+    for dimension in DIMENSION_LABELS:
+        penalty = details[f"{dimension}_penalty"].fillna(0.0)
+        buckets = pd.qcut(penalty.rank(method="first"), 5, labels=False)
+        rates = labels.groupby(buckets).mean().reindex(range(5))
+        dimension_diagnostics[dimension] = {
+            "auc": _safe_float(binary_auc(labels, penalty)),
+            "future_rate_by_risk_quintile": [_safe_float(value) for value in rates],
+            "quintile_rate_monotonic": bool(rates.dropna().is_monotonic_increasing),
+        }
+    energy_diagnostics = []
+    for energy_type, indices in details.groupby("energy_type", dropna=False).groups.items():
+        group_labels = labels.loc[indices]
+        group_risk = 100.0 - details.loc[indices, "safety_score"]
+        energy_diagnostics.append({
+            "energy_type": str(energy_type),
+            "vehicles": int(len(indices)),
+            "positives": int(group_labels.fillna(0).sum()),
+            "auc": _safe_float(binary_auc(group_labels, group_risk)),
+            "future_label_has_two_classes": bool(group_labels.dropna().nunique() == 2),
+        })
+    behavior_risk = sum(
+        details[f"{dimension}_contribution"]
+        for dimension in DIMENSION_LABELS
+        if dimension != "history"
+    )
+    behavior_auc = binary_auc(labels, behavior_risk)
     return {
         "status": "pass" if monotonic and bottom > top else "review_required",
         "future_event_rate_by_level": {key: _safe_float(value) for key, value in level_rates.items()},
@@ -44,6 +75,10 @@ def _future_validation(details: pd.DataFrame, future_label: pd.Series | None) ->
         "riskiest_20pct_future_rate": _safe_float(bottom),
         "level_rate_monotonic": monotonic,
         "riskiest_minus_safest": _safe_float(bottom - top),
+        "overall_risk_auc": _safe_float(overall_auc),
+        "dimension_diagnostics": dimension_diagnostics,
+        "energy_type_future_discrimination": energy_diagnostics,
+        "behavior_without_history_future_auc": _safe_float(behavior_auc),
     }
 
 
@@ -118,8 +153,10 @@ def validate_score_frame(
             f"top_reason_{index}_code", f"top_reason_{index}_dimension",
             f"top_reason_{index}_penalty_points", f"top_reason_{index}_event_count",
             f"top_reason_{index}_normalized_rate", f"top_reason_{index}_percentile",
+            f"top_reason_{index}_source_event_codes", f"top_reason_{index}_source_fields",
         ]
         reasons_traceable &= all(column in details and details[column].notna().all() for column in columns)
+        reasons_traceable &= bool(details[f"top_reason_{index}_source_fields"].ne("").all())
     static_pass = bool(
         all(core_checks.values())
         and level_summary["mean_score"].is_monotonic_decreasing

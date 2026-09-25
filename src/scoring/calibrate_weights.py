@@ -7,7 +7,7 @@ import pandas as pd
 
 from .event_taxonomy import DIMENSION_LABELS
 from .exposure_adjustment import monotone_percentile_penalty
-from .scoring_rules import DEFAULT_WEIGHTS, validate_weights
+from .scoring_rules import DEFAULT_WEIGHTS, DIMENSION_PENALTY_CAPS, validate_weights
 
 
 def fit_penalty_model(rows: pd.DataFrame) -> tuple[dict, pd.DataFrame]:
@@ -20,10 +20,10 @@ def fit_penalty_model(rows: pd.DataFrame) -> tuple[dict, pd.DataFrame]:
             reference = sorted(float(value) for value in rate.dropna().clip(lower=0))
             fitted[f"{dimension}_rate"] = rate
             fitted[f"{dimension}_penalty"] = monotone_percentile_penalty(
-                rate, available=rate.notna(), cap=60.0, reference_rate=reference
+                rate, available=rate.notna(), cap=DIMENSION_PENALTY_CAPS[dimension], reference_rate=reference
             ).to_numpy()
             model["dimensions"][dimension] = {
-                "cap": 60.0,
+                "cap": DIMENSION_PENALTY_CAPS[dimension],
                 "reference_rate": reference,
             }
             continue
@@ -39,12 +39,12 @@ def fit_penalty_model(rows: pd.DataFrame) -> tuple[dict, pd.DataFrame]:
         reference = sorted(float(value) for value in rate.dropna().clip(lower=0))
         fitted[f"{dimension}_rate"] = rate
         fitted[f"{dimension}_penalty"] = monotone_percentile_penalty(
-            rate, reference_rate=reference
+            rate, cap=DIMENSION_PENALTY_CAPS[dimension], reference_rate=reference
         ).to_numpy()
         model["dimensions"][dimension] = {
             "prior_mean": prior_mean,
             "prior_exposure": prior_exposure,
-            "cap": 100.0,
+            "cap": DIMENSION_PENALTY_CAPS[dimension],
             "reference_rate": reference,
         }
     return model, fitted
@@ -157,6 +157,19 @@ def calibrate_weights(
     windows = None if window_id is None else pd.Series(window_id).reset_index(drop=True)
     aucs = _signals_by_window(penalty_frame, labels, windows)
     coefficients = _regularized_coefficients(penalty_frame, labels)
+    direction_stability = {
+        dimension: {
+            "direction": (
+                "positive" if values and all(value >= 0.5 for value in values)
+                else "negative" if values and all(value <= 0.5 for value in values)
+                else "mixed"
+            ),
+            "stable": bool(values) and (
+                all(value >= 0.5 for value in values) or all(value <= 0.5 for value in values)
+            ),
+        }
+        for dimension, values in aucs.items()
+    }
     signals = {
         dimension: max(0.0, coefficients[dimension])
         * max(0.0, float(np.median(values)) - 0.5)
@@ -169,6 +182,7 @@ def calibrate_weights(
             "status": "initial_weights_no_stable_positive_signal",
             "window_auc": aucs,
             "logistic_coefficients": coefficients,
+            "direction_stability": direction_stability,
         }
     target = {dimension: signals[dimension] / signal_total for dimension in initial}
     target["imu_evidence"] = min(target["imu_evidence"], 0.10)
@@ -195,6 +209,10 @@ def calibrate_weights(
         "status": status,
         "window_auc": aucs,
         "logistic_coefficients": coefficients,
+        "direction_stability": direction_stability,
+        "positive_calibration_dimensions": [
+            dimension for dimension, signal in signals.items() if signal > 0
+        ],
         "signals": signals,
         "max_change": max_change,
         "blend": blend,

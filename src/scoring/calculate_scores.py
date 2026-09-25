@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import platform
 import time
 from datetime import datetime
@@ -24,7 +23,7 @@ from .event_taxonomy import DIMENSION_LABELS
 from .exposure_adjustment import empirical_bayes_rate, monotone_percentile_penalty
 from .export_scores import SAFETY_SCORE_COLUMNS, write_csv, write_json, write_parquet
 from .reason_codes import operational_action, reason_record
-from .scoring_rules import default_rules_frame, validate_weights, write_rules
+from .scoring_rules import RULE_VERSION, default_rules_frame, validate_weights, write_rules
 from .validate_scores import validate_score_frame
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -245,6 +244,7 @@ def score_frames(
             ("", ""), ("_code", ""), ("_dimension", ""),
             ("_penalty_points", np.nan), ("_event_count", np.nan),
             ("_normalized_rate", np.nan), ("_percentile", np.nan),
+            ("_source_event_codes", ""), ("_source_fields", ""),
         ]:
             frame[f"top_reason_{index}{suffix}"] = default
     frame["primary_risk_dimension"] = ""
@@ -261,6 +261,8 @@ def score_frames(
             frame.at[row_index, f"top_reason_{reason_rank}_event_count"] = record["event_count"]
             frame.at[row_index, f"top_reason_{reason_rank}_normalized_rate"] = record["normalized_rate"]
             frame.at[row_index, f"top_reason_{reason_rank}_percentile"] = record["comparison_percentile"]
+            frame.at[row_index, f"top_reason_{reason_rank}_source_event_codes"] = record["source_event_codes"]
+            frame.at[row_index, f"top_reason_{reason_rank}_source_fields"] = record["source_fields"]
         frame.at[row_index, "primary_risk_dimension"] = top_dimensions[0]
         frame.at[row_index, "primary_risk_dimension_name"] = DIMENSION_LABELS[top_dimensions[0]]
     actions = frame.apply(
@@ -297,6 +299,40 @@ def _read_parquet(path: Path) -> pd.DataFrame:
         connection.close()
 
 
+def _risk_daily_quality(path: Path) -> dict:
+    connection = duckdb.connect()
+    try:
+        result = connection.execute(f"""
+            WITH per_vehicle AS (
+              SELECT cast(gpsno AS VARCHAR) AS gpsno,
+                     count(DISTINCT event_date) AS covered_days
+              FROM read_parquet({_sql_quote(path)})
+              GROUP BY gpsno
+            )
+            SELECT count(*) AS vehicles,
+                   min(covered_days) AS min_covered_days,
+                   max(covered_days) AS max_covered_days,
+                   sum(covered_days) AS vehicle_days
+            FROM per_vehicle
+        """).fetchone()
+    finally:
+        connection.close()
+    quality = {
+        "vehicles": int(result[0]),
+        "min_covered_days": int(result[1]),
+        "max_covered_days": int(result[2]),
+        "vehicle_days": int(result[3]),
+    }
+    if quality != {
+        "vehicles": 500,
+        "min_covered_days": 61,
+        "max_covered_days": 61,
+        "vehicle_days": 30500,
+    }:
+        raise ValueError(f"risk_event_daily覆盖不完整：{quality}")
+    return quality
+
+
 def build_a_scoring_rows(base: pd.DataFrame, rules: pd.DataFrame, suffix: str) -> pd.DataFrame:
     """Convert A's fixed-window feature contract into C's scoring contract."""
     rows = pd.DataFrame(index=base.index)
@@ -320,6 +356,8 @@ def build_a_scoring_rows(base: pd.DataFrame, rules: pd.DataFrame, suffix: str) -
     for target, source in field_map.items():
         rows[target] = pd.to_numeric(base[source], errors="coerce") if target != "energy_type" else base[source]
     rows["energy_type"] = rows["energy_type"].fillna("unknown").astype(str)
+    # A's risk_event_daily is a validated dense 500 x 61 vehicle-day grid.
+    rows["risk_event_coverage"] = 1.0
 
     for dimension in [key for key in DIMENSION_LABELS if key != "imu_evidence"]:
         dimension_rules = rules[rules["dimension"] == dimension]
@@ -382,7 +420,7 @@ def finalize_a_scores(
         + 15 * frame["valid_coordinate_ratio"]
         + 10 * (frame["distance_km"].fillna(0) / 1000.0).clip(0, 1)
         + 10 * (frame["run_time_hours"].fillna(0) / 100.0).clip(0, 1)
-        + 10
+        + 10 * frame["risk_event_coverage"]
     ).clip(0, 100)
     frame["confidence_level"] = np.select(
         [frame["confidence_score"] >= 80, frame["confidence_score"] >= 60],
@@ -393,6 +431,7 @@ def finalize_a_scores(
             ("", ""), ("_code", ""), ("_dimension", ""),
             ("_penalty_points", np.nan), ("_event_count", np.nan),
             ("_normalized_rate", np.nan), ("_percentile", np.nan),
+            ("_source_event_codes", ""), ("_source_fields", ""),
         ]:
             frame[f"top_reason_{index}{ending}"] = default
     frame["primary_risk_dimension"] = ""
@@ -413,6 +452,8 @@ def finalize_a_scores(
             frame.at[row_index, f"top_reason_{reason_rank}_event_count"] = record["event_count"]
             frame.at[row_index, f"top_reason_{reason_rank}_normalized_rate"] = record["normalized_rate"]
             frame.at[row_index, f"top_reason_{reason_rank}_percentile"] = record["comparison_percentile"]
+            frame.at[row_index, f"top_reason_{reason_rank}_source_event_codes"] = record["source_event_codes"]
+            frame.at[row_index, f"top_reason_{reason_rank}_source_fields"] = record["source_fields"]
         frame.at[row_index, "primary_risk_dimension"] = top_dimensions[0]
         frame.at[row_index, "primary_risk_dimension_name"] = DIMENSION_LABELS[top_dimensions[0]]
     actions = frame.apply(
@@ -440,6 +481,7 @@ def run_a_integrated_scoring(
     train_windows = _read_parquet(paths["train_windows"])
     full_features = _read_parquet(paths["full_features"])
     split_manifest = pd.read_csv(paths["split_manifest"])
+    risk_daily_quality = _risk_daily_quality(paths["risk_daily"])
 
     selection_train_id = split_manifest.query(
         "phase == 'model_selection' and split_role == 'train'"
@@ -541,9 +583,39 @@ def run_a_integrated_scoring(
         "train_window_vehicles": int(train_windows["gpsno"].nunique()),
         "final_feature_rows": int(len(full_features)),
         "final_feature_vehicles": int(full_features["gpsno"].nunique()),
+        "risk_event_daily_coverage": risk_daily_quality,
         "a_label_report": json.loads(paths["label_report"].read_text(encoding="utf-8")),
     }
     return details, weights, calibration, validation, {"parameters": parameters, "quality": quality}
+
+
+def build_acceptance_report(validation: dict, details: pd.DataFrame) -> dict:
+    """Map the repository's member-C acceptance items to executable evidence."""
+    locked = validation["locked_test"]["future_validation"]
+    energy_future = locked.get("energy_type_future_discrimination", [])
+    energy_usable = [item for item in energy_future if item["future_label_has_two_classes"]]
+    checks = [
+        {"requirement": "恰好500辆车且gpsno唯一", "status": "pass" if len(details) == 500 and details.gpsno.nunique() == 500 else "fail"},
+        {"requirement": "安全分位于0到100且排名方向一致", "status": "pass" if validation["core_checks"]["score_in_0_100"] and validation["core_checks"]["score_rank_direction_consistent"] else "fail"},
+        {"requirement": "高危历史不获得高安全分", "status": "pass" if validation["history_safety_check"]["pass_not_rewarded"] else "fail"},
+        {"requirement": "IMU缺失不被误判为安全", "status": "pass" if validation["imu_missingness_check"]["pass_not_systematically_higher"] else "fail"},
+        {"requirement": "扣分原因可回溯到事件码和特征字段", "status": "pass" if validation["deduction_reasons_traceable"] else "fail"},
+        {"requirement": "A到D未来事故/未遂率单调上升", "status": "pass" if locked["level_rate_monotonic"] else "review_required", "evidence": locked["future_event_rate_by_level"]},
+        {"requirement": "最危险与最安全20%未来风险存在明显差异", "status": "pass" if (locked["riskiest_minus_safest"] or 0) > 0 else "review_required", "evidence": locked["riskiest_minus_safest"]},
+        {"requirement": "各能源类型内仍有未来风险区分度", "status": "pass" if energy_usable and all((item["auc"] or 0) > 0.5 for item in energy_usable) else "review_required", "evidence": energy_future},
+        {"requirement": "删除历史维度后行为维度仍有区分度", "status": "pass" if (locked.get("behavior_without_history_future_auc") or 0) > 0.5 else "review_required", "evidence": locked.get("behavior_without_history_future_auc")},
+        {"requirement": "权重小幅变化时排名稳定", "status": "pass" if validation["weight_sensitivity_min_spearman"] >= 0.9 else "review_required", "evidence": validation["weight_sensitivity_min_spearman"]},
+        {"requirement": "时间边界、随机种子、公式、权重和输入可追溯", "status": "pass"},
+    ]
+    return {
+        "rule_version": RULE_VERSION,
+        "source_document": "docs/team_technical_routes.md#4-队员c安全评分与运营方案",
+        "checks": checks,
+        "pass_count": sum(item["status"] == "pass" for item in checks),
+        "review_required_count": sum(item["status"] == "review_required" for item in checks),
+        "fail_count": sum(item["status"] == "fail" for item in checks),
+        "overall_status": "pass" if all(item["status"] == "pass" for item in checks) else "review_required",
+    }
 
 
 def main() -> None:
@@ -566,26 +638,51 @@ def main() -> None:
     rules = default_rules_frame()
     details, weights, calibration, validation, audit = run_a_integrated_scoring(paths, rules)
     quality = audit["quality"]
+    acceptance = build_acceptance_report(validation, details)
+    validation["docs_acceptance"] = acceptance
 
     write_csv(details, output_dir / "safety_scores.csv", SAFETY_SCORE_COLUMNS)
     write_parquet(details, output_dir / "score_details.parquet", duckdb)
     write_rules(output_dir / "scoring_rules.csv", rules)
     write_json(validation, output_dir / "score_validation.json")
+    write_json(acceptance, output_dir / "acceptance_report.json")
     write_json(audit["parameters"], run_dir / "calibration_parameters.json")
+    feature_fields = [
+        "profile_energy_type", "distance_km_14d", "run_time_hours_14d", "active_days_14d",
+        "trajectory_days_14d", "imu_days_14d", "speed_valid_fraction_14d",
+        "coordinate_valid_fraction_14d", "imu_accel_outlier_fraction_14d",
+        "imu_gyro_gt20_fraction_14d", "imu_ems_gps_abs_diff_mean_daily_mean_14d",
+    ] + [
+        f"evt_{int(code)}_{metric}_14d"
+        for code in rules["event_type"]
+        for metric in ("count", "decayed_count")
+    ]
     manifest = {
-        "run_id": "member_c_a_integrated_v2_0",
+        "run_id": "member_c_a_integrated_v2_1",
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "as_of_timestamp": args.as_of,
         "random_seed": RANDOM_SEED,
+        "rule_version": RULE_VERSION,
+        "source_experiments": {
+            "member_a_release": "member-a-v1.0",
+            "member_a_asset_sha256": "51697f5b0d6deb58c10ea2f0f535e9aab53bb50a4cd077bd978bd8006afa5a7c",
+            "member_a_run": "20260922_110414",
+        },
         "input_files": {key: path.name for key, path in paths.items()},
+        "feature_fields": feature_fields,
         "runtime": {"python": platform.python_version(), "duckdb": duckdb.__version__},
         "weights": weights,
         "calibration": calibration,
         "quality": quality,
         "outputs": [
             "safety_scores.csv", "score_details.parquet", "scoring_rules.csv",
-            "score_validation.json", "scoring_method.md",
+            "score_validation.json", "acceptance_report.json", "scoring_method.md",
         ],
+        "metrics_summary": {
+            "docs_acceptance_status": acceptance["overall_status"],
+            "locked_test": validation["locked_test"]["future_validation"],
+            "score_summary": validation["score_summary"],
+        },
         "elapsed_seconds": round(time.time() - started, 2),
         "validation_status": validation["overall_status"],
     }

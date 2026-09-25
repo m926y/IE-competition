@@ -63,6 +63,7 @@ class ScorePipelineTest(unittest.TestCase):
         self.assertTrue(details.safety_score.between(0, 100).all())
         self.assertEqual(details.risk_level.value_counts().to_dict(), {"B": 200, "C": 150, "A": 100, "D": 50})
         self.assertTrue(details[["top_reason_1", "top_reason_2", "top_reason_3"]].ne("").all().all())
+        self.assertTrue(details[[f"top_reason_{i}_source_fields" for i in range(1, 4)]].ne("").all().all())
 
     def test_static_validation_passes(self):
         report = validate_score_frame(self.details, self.weights, self.calibration)
@@ -82,6 +83,8 @@ class ScorePipelineTest(unittest.TestCase):
         labels = self.details.risk_level.map({"A": 0, "B": 0, "C": 1, "D": 1})
         report = validate_score_frame(self.details, self.weights, self.calibration, labels)
         self.assertEqual(report["future_validation"]["status"], "pass")
+        self.assertGreater(report["future_validation"]["overall_risk_auc"], 0.5)
+        self.assertGreater(report["future_validation"]["behavior_without_history_future_auc"], 0.5)
 
 
 if __name__ == "__main__":
