@@ -201,9 +201,7 @@ def score_frames(
         + 0.30 * frame.loc[imu_available, "gyro_norm_gt20_rows"] / frame.loc[imu_available, "imu_source_rows"]
         + 0.10 * (frame.loc[imu_available, "ems_gps_abs_diff_mean"] / 20.0).clip(0, 1)
     ) / (0.90 + 0.10 * speed_difference_available.loc[imu_available].astype(float))
-    frame["imu_evidence_event_count"] = (
-        frame["accel_norm_outlier_rows"] + frame["gyro_norm_gt20_rows"]
-    ).fillna(0).astype(int)
+    frame["imu_evidence_event_count"] = (frame["accel_norm_outlier_rows"]+frame["gyro_norm_gt20_rows"]).fillna(0).astype(int)
     frame["imu_evidence_exposure"] = frame["imu_source_rows"]
     frame["imu_evidence_rate"] = imu_rate
     frame["imu_evidence_penalty"] = monotone_percentile_penalty(
@@ -283,58 +281,3 @@ def score_frames(
     frame["confidence_score"] = frame["confidence_score"].round(2)
     return frame, weights, calibration
 
-
-def main() -> None:
-    if duckdb is None:
-        raise SystemExit("缺少DuckDB。请执行：python -m pip install -r src/scoring/requirements.txt")
-    parser = argparse.ArgumentParser(description="生成成员C的安全评分、解释、运营动作和验证报告")
-    parser.add_argument("--cleaned-dir", type=Path, default=DEFAULT_CLEANED_DIR)
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR)
-    parser.add_argument("--as-of", default=AS_OF_TS)
-    parser.add_argument('--start-date', default='2026-06-01')
-    args = parser.parse_args()
-
-    started = time.time()
-    paths = resolve_inputs(args.cleaned_dir.resolve())
-    output_dir = args.output_dir.resolve()
-    run_dir = args.run_dir.resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    run_dir.mkdir(parents=True, exist_ok=True)
-    rules = default_rules_frame()
-    profile, trajectory, imu, risk, quality = collect_cleaned_frames(paths, rules, args.as_of,args.start_date)
-    days=(pd.Timestamp(args.as_of).normalize()-pd.Timestamp(args.start_date)).days+1
-    details, weights, calibration = score_frames(profile, trajectory, imu, risk,observation_days=days)
-    validation = validate_score_frame(details, weights, calibration)
-
-    write_csv(details, output_dir / "safety_scores.csv", SAFETY_SCORE_COLUMNS)
-    write_parquet(details, output_dir / "score_details.parquet", duckdb)
-    write_rules(output_dir / "scoring_rules.csv", rules)
-    write_json(validation, output_dir / "score_validation.json")
-    manifest = {
-        "run_id": "member_c_pre_a_v1_1",
-        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "as_of_timestamp": args.as_of,
-        "random_seed": RANDOM_SEED,
-        "input_files": {key: path.name for key, path in paths.items()},
-        "runtime": {"python": platform.python_version(), "duckdb": duckdb.__version__},
-        "weights": weights,
-        "calibration": calibration,
-        "quality": quality,
-        "outputs": [
-            "safety_scores.csv", "score_details.parquet", "scoring_rules.csv",
-            "score_validation.json", "scoring_method.md",
-        ],
-        "elapsed_seconds": round(time.time() - started, 2),
-        "validation_status": validation["overall_static_status"],
-    }
-    write_json(manifest, run_dir / "run_manifest.json")
-    print(
-        f"完成：{len(details)}辆车；静态验证={validation['overall_static_status']}；"
-        f"未来标签验证={validation['future_validation']['status']}；"
-        f"耗时={manifest['elapsed_seconds']}秒"
-    )
-
-
-if __name__ == "__main__":
-    main()

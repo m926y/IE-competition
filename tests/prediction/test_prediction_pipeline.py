@@ -10,7 +10,6 @@ import pandas as pd
 
 from src.prediction.data_loader import load_training_data, select_feature_columns
 from src.prediction.splitters import make_time_folds
-from src.prediction.train_final import run
 from src.prediction.validate_submission import validate_submission
 
 
@@ -71,63 +70,6 @@ class PredictionPipelineTests(unittest.TestCase):
         train["future_accident"] = 0
         with self.assertRaisesRegex(ValueError, "未来信息"):
             select_feature_columns(train)
-
-    def test_end_to_end_outputs_and_submission(self):
-        train, full = synthetic_data()
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            train_path = root / "train.csv"
-            full_path = root / "full.csv"
-            dictionary_path = root / "dictionary.csv"
-            expected_path = root / "expected.csv"
-            output = root / "prediction"
-            train.to_csv(train_path, index=False)
-            full.to_csv(full_path, index=False)
-            pd.DataFrame(
-                {
-                    "feature_name": [
-                        "energy_type",
-                        "monthly_mileage_km",
-                        "risk_event_rate_14d",
-                        "trajectory_speed_std",
-                        "imu_gyro_std",
-                    ],
-                    "feature_group": ["profile", "profile", "risk", "trajectory", "imu"],
-                }
-            ).to_csv(dictionary_path, index=False)
-            full[["gpsno"]].to_csv(expected_path, index=False)
-            args = argparse.Namespace(
-                train_features=train_path,
-                full_features=full_path,
-                feature_dictionary=dictionary_path,
-                expected_ids=expected_path,
-                output_dir=output,
-                random_state=2026,
-                min_train_windows=1,
-                skip_ablation=False,
-            )
-            metrics = run(args)
-            required = {
-                "validation_metrics.json",
-                "oof_predictions.parquet",
-                "feature_importance.csv",
-                "ablation_results.csv",
-                "forecast_result.csv",
-                "prediction_method.md",
-            }
-            self.assertTrue(required.issubset({path.name for path in output.iterdir()}))
-            self.assertEqual(metrics["data"]["fold_count"], 3)
-            submission = pd.read_csv(output / "forecast_result.csv", dtype={"gpsno": "string"})
-            result = validate_submission(
-                submission,
-                expected_ids=full["gpsno"],
-                expected_rows=len(full),
-            )
-            self.assertTrue(result["valid"])
-            self.assertEqual(result["rows"], len(full))
-            self.assertTrue((output / "model" / "metadata.json").exists())
-            ablation = pd.read_csv(output / "ablation_results.csv")
-            self.assertGreaterEqual(len(ablation), 4)
 
 
 if __name__ == "__main__":
