@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 from pypdf import PdfReader
 from src.prediction.validate_submission import validate_submission
-from src.scoring.enhanced import DIMS
+from src.scoring.score_core import DIMS
 
 EXPECTED = {'forecast_result.csv', 'safety_scores.csv', 'method_report.pdf', 'source_code.zip'}
 
@@ -26,7 +26,7 @@ def allowed_archive_name(name):
         return True
     return ((path.parts[0] in {'src', 'tests'} and path.suffix == '.py')
             or (path.parts[0] == 'src' and path.name == 'README.md')
-            or (path.parts[0] == 'docs' and path.suffix == '.md')
+            or (path.parts[0] == 'docs' and path.suffix in {'.md', '.tex'})
             or (path.parts[0] in {'configs', 'evidence'} and path.suffix == '.json'))
 
 
@@ -91,8 +91,8 @@ def validate(folder, expected_ids=None):
             if digest(archive.read(name)) != fingerprint:
                 raise ValueError(f'ZIP manifest hash mismatch: {name}')
         required = {'src/reproduce_submission.py', 'README.md', 'requirements-lock.txt',
-                    'configs/submission/prediction_selection.json', 'configs/submission/baseline_selection.json',
-                    'configs/submission/scoring_frozen.json'}
+                    'configs/submission/prediction_features.json',
+                    'configs/submission/scoring_reference.json', 'docs/method_report.tex'}
         if not required.issubset(names):
             raise ValueError('Missing reproduction files')
     return {'status': 'pass', 'files': files, 'task1': result, 'task2_rows': len(scores),

@@ -65,7 +65,7 @@ def collect_cleaned_frames(paths: dict[str, Path], rules: pd.DataFrame, as_of_ts
     if pd.Timestamp(start_date)>cutoff:
         raise ValueError('start_date must not exceed as_of')
     if duckdb is None:
-        raise RuntimeError("缺少DuckDB。请执行：python -m pip install -r src/scoring/requirements.txt")
+        raise RuntimeError("缺少DuckDB。请执行：python -m pip install -r requirements.txt")
     connection = duckdb.connect()
     connection.register("scoring_rules", rules)
     try:

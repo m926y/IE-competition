@@ -1,6 +1,5 @@
-"""Reproduce official outputs with frozen B configuration; never launch a new B search."""
+"""Reproduce the competition forecast, safety scores, and four-file package."""
 import argparse
-import json
 from pathlib import Path
 import subprocess
 import sys
@@ -21,10 +20,8 @@ def run():
     if args.rebuild_features or not (ROOT / 'outputs/features/feature_quality.json').exists():
         command('src.features.pipeline', '--overwrite')
     command('src.features.audit_delivery')
-    from src.prediction.optimize import reproduce_frozen
-    reproduce_frozen()
-    command('src.prediction.robustness')
-    command('src.scoring.enhanced')
+    command('src.prediction.forecast_v2')
+    command('src.scoring.evidence_score')
     subprocess.run([sys.executable, '-m', 'unittest', 'discover', '-s', 'tests', '-q'], check=True, cwd=ROOT)
     if args.package:
         command('src.delivery.build')

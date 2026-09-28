@@ -8,9 +8,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .data_loader import ID_COLUMN, read_table
-
-
 EXPECTED_COLUMNS = ["gpsno", "accident", "risk_prob"]
 
 
@@ -60,10 +57,12 @@ def main() -> None:
     parser.add_argument("--expected-ids", type=Path)
     parser.add_argument("--expected-rows", type=int, default=500)
     args = parser.parse_args()
-    submission = pd.read_csv(args.submission, dtype={ID_COLUMN: "string"})
+    submission = pd.read_csv(args.submission, dtype={"gpsno": "string"})
     ids = None
     if args.expected_ids:
-        ids = read_table(args.expected_ids)[ID_COLUMN].astype("string")
+        source = (pd.read_parquet(args.expected_ids) if args.expected_ids.suffix == ".parquet"
+                  else pd.read_csv(args.expected_ids, dtype={"gpsno": "string"}))
+        ids = source["gpsno"].astype("string")
     result = validate_submission(
         submission, expected_ids=ids, expected_rows=args.expected_rows
     )

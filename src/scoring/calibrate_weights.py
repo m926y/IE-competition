@@ -38,7 +38,7 @@ def _regularized_coefficients(penalties: pd.DataFrame, labels: pd.Series) -> dic
     try:
         from sklearn.linear_model import LogisticRegression
     except ImportError as exc:  # pragma: no cover - only reached for label calibration
-        raise RuntimeError("权重校准需要scikit-learn，请安装 src/scoring/requirements.txt") from exc
+        raise RuntimeError("权重校准需要scikit-learn，请安装 requirements.txt") from exc
     dimensions = list(DEFAULT_WEIGHTS)
     columns = [f"{dimension}_penalty" for dimension in dimensions]
     usable = labels.notna()

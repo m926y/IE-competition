@@ -1,5 +1,3 @@
-# 最终事故预测
+# 任务一：40 天事故风险预测
 
-唯一入口：python -m src.prediction.optimize。读取configs/submission冻结配置，输出outputs/prediction。正式目标浅层LightGBM与三种子辅助模型等权排名融合，辅助模型增加7维训练期收缩风险率。
-
-模型包含预处理、校准、先验、阈值与完整车队ID；predict_bundle必须整批500车、同一截止日。40天概率为明确假设下的外推，未来真值未验证。历史AUC 0.819991、AP 0.157706；详见docs/final_optimization.md。
+运行 `python -m src.prediction.forecast_v2`，生成 `outputs/prediction/v2/forecast_result.csv` 和内部验证记录。模型使用截至 2026-07-31 的 14 天特征，直接学习比赛定义的未来 40 天二分类标签。历史验证按车辆分组，概率经训练外校准。固定特征列见 `configs/submission/prediction_features.json`。

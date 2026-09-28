@@ -1,7 +1,3 @@
-# 最终司机安全评分
+# 任务二：司机安全评分
 
-入口：python -m src.scoring.enhanced；更新：python -m src.scoring.enhanced --as-of 2026-07-31。输出outputs/scoring。
-
-固定14天观察与半衰期，读取configs/submission/scoring_frozen.json的参考分布和权重。行为安全分=100减六维贡献；IMU缺失的不确定性只影响单列下界。贡献包含先验收缩，等级按20%/40%/30%/10%容量分层。
-
-提供8天动态评分、7日变化、等级观察率Wilson区间与前三项原因。IMU异常采样点不是独立事件数；低可信度先复核设备，不自动处罚。详见docs/final_optimization.md。
+运行 `python -m src.scoring.evidence_score`，生成 `outputs/scoring/v2/safety_scores.csv`、事件归因台账和历史验证记录。评分使用 14 天行为证据、六维权重和冻结参考分布；公开扣分扣除同暴露零事件先验背景。缺失 IMU 影响单独的可信度和保守下界。预测概率仅进入复核队列，不改写安全分。配置见 `configs/submission/scoring_reference.json`。

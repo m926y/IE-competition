@@ -1,5 +1,5 @@
 {
-  "features": [
+  "core_features": [
     "distance_km_14d",
     "trajectory_coverage_14d",
     "distance_daily_std_14d",
@@ -100,25 +100,5 @@
     "management_rate_per_100h_14d",
     "management_recency_days_14d",
     "blind_spot_count_14d"
-  ],
-  "model": "lightgbm",
-  "params": {
-    "max_depth": 2,
-    "num_leaves": 7,
-    "learning_rate": 0.03,
-    "min_child_samples": 40,
-    "subsample": 0.8,
-    "colsample_bytree": 0.7,
-    "reg_alpha": 0.5,
-    "reg_lambda": 5.0
-  },
-  "iterations": 63,
-  "threshold14": {
-    "threshold": 0.008740102180349705,
-    "recall": 0.8333333333333334,
-    "specificity": 0.7206477732793521
-  },
-  "blend": "disabled: only one independent selection window",
-  "label": "accident_count>=1 OR near_miss_count>=2",
-  "seed": 2026
+  ]
 }
