@@ -318,7 +318,7 @@ try {
     check("司机 review 权限 → 403", (await req("/api/training-tasks/task-1/review", { method: "POST", cookie: DC, body: { decision: "approved", reason: "x" } })).status === 403);
     check("管理员 review 不存在任务 → 404", (await req("/api/training-tasks/task-x/review", { method: "POST", cookie: C, body: { decision: "approved", reason: "x" } })).status === 404);
     const notesN = (await req("/api/data/admin.notifications?limit=20", { cookie: C })).json?.rows || [];
-    check("通知全部来自真实实体(干预链+团队审核后的真实培训链+复核申请)，无门禁绕过", notesN.every((n) => ["intervention", "training_task", "review_request", "daily_safety_report"].includes(String(n.source_entity_type))) && notesN.some((n) => n.type === "rr_submitted" || notesN.length >= 1));
+    check("通知全部来自真实实体(干预链+团队审核后的真实培训链+复核申请)，无门禁绕过", notesN.every((n) => ["intervention", "training_task", "review_request", "daily_safety_report", "offline_training", "handover_report"].includes(String(n.source_entity_type))) && notesN.some((n) => n.type === "rr_submitted" || notesN.length >= 1));
   }
 
   // --- 第13轮：运行时AI（工具链自检+真实模型+越权拒绝+草稿零写入） ---
