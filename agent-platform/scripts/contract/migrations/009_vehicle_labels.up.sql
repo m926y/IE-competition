@@ -21,3 +21,4 @@ CREATE TRIGGER tr_driver_vehicle_label AFTER INSERT OR UPDATE OF gpsno ON driver
 -- Match the existing deployment's database role grants for this new read table.
 GRANT SELECT ON vehicle_labels TO anon, authenticated, service_role;
 COMMIT;
+-- 注：托管执行时移除了 GRANT 行（平台权限由托管层托管）；2026-11-02 经控制 API 执行成功。

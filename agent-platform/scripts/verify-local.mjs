@@ -96,7 +96,13 @@ try {
   check("已核实绑定司机可查本人明细（200，行级过滤）", ms.status === 200 && (ms.json?.rows || []).every((x) => String(x.driver_id || "DEMO_D0149") === "DEMO_D0149") && (ms.json?.rows || []).length > 0, "st=" + ms.status + " n=" + (ms.json?.rows || []).length);
   const nbu = await req("/api/admin/users", { method: "POST", cookie: C, body: { username: "r23v_nb_" + (Date.now() % 100000), role: "driver", display_name: "R23 未绑定断言", reveal_password: true } });
   const nbLogin = await req("/api/auth/login", { method: "POST", body: { username: nbu.json?.username, password: nbu.json?.initial_password } });
-  { const nbCk = nbLogin.setCookie; const chk = await req("/api/data/my.score", { cookie: nbCk }); check("未绑定司机查本人明细 → 409 binding_required", chk.status === 409 && chk.json?.error === "binding_required", "st=" + chk.status + (chk.json?.error || "")); await req("/api/admin/users/" + (nbu.json?.user_id || ""), { method: "POST", cookie: C, body: { account_status: "disabled" } }); }
+  { const nbCk = nbLogin.setCookie;
+    const nbPw2 = "Nb" + (Date.now() % 100000000) + "x7q"; // 交付版 v0.3.0：新建账号首登强制改密（must_change_password）
+    const pc = await req("/api/me/password", { method: "POST", cookie: nbCk, body: { current_password: nbu.json?.initial_password, new_password: nbPw2 } });
+    check("新建账号首登强制改密 → 200", pc.status === 200, "st=" + pc.status + (pc.json?.error || ""));
+    const nbL2 = await req("/api/auth/login", { method: "POST", body: { username: nbu.json?.username, password: nbPw2 } });
+    const nbCk2 = nbL2.setCookie;
+    const chk = await req("/api/data/my.score", { cookie: nbCk2 }); check("未绑定司机查本人明细 → 409 binding_required", chk.status === 409 && chk.json?.error === "binding_required", "st=" + chk.status + (chk.json?.error || "")); await req("/api/admin/users/" + (nbu.json?.user_id || ""), { method: "POST", cookie: C, body: { account_status: "disabled" } }); }
   const mn = await req("/api/data/my.notifications", { cookie: DC });
   check("司机本人通知资源可用（服务端已注入 target_user_id）", mn.status === 200 && mn.json.table === "notification_events");
   const forged = await req("/api/data/my.interventions?driver_id=eq.D-OTHER", { cookie: DC });
@@ -186,7 +192,7 @@ try {
   check("同一对象重叠绑定 → 409（legacy 或时段冲突引擎）", conflict.status === 409 && String(conflict.json?.error || "").includes("binding_"), "err=" + conflict.json?.error);
   const unbindFirst = await req("/api/admin/bindings", { method: "POST", cookie: C, body: { user_id: adminId, driver_id: null, verified: false, note: "" } });
   check("解绑测试账号成功", unbindFirst.status === 200 && unbindFirst.json.driver_id === null);
-  { const bl = await req("/api/admin/bindings", { cookie: C }); const mine = (bl.json?.rows || []).filter((x) => String(x.driver_id) === "DEMO_D0470" && String(x.user_id) === adminId); for (const x of mine) await req("/api/admin/binding-delete", { method: "POST", cookie: C, body: { binding_id: x.binding_id } }); const demoRows = (await req("/api/admin/bindings", { cookie: C })).json?.rows || []; check("R23 测试绑定行已清理（D0470 无残留）", !demoRows.some((x) => x.driver_id === "DEMO_D0470")); }
+  { const bl = await req("/api/admin/bindings", { cookie: C }); const mine = (bl.json?.rows || []).filter((x) => String(x.driver_id) === "DEMO_D0470" && String(x.user_id) === adminId); for (const x of mine) await req("/api/admin/binding-delete", { method: "POST", cookie: C, body: { binding_id: x.binding_id } }); const demoRows = (await req("/api/admin/bindings", { cookie: C })).json?.rows || []; check("R23 测试绑定已清理（无 active 残留；inactive 由交付版 delete 语义转为留档）", !demoRows.some((x) => x.driver_id === "DEMO_D0470" && String(x.account_status) === "active")); }
   const bind = unbindFirst; // 变量占位避免误用
   const _bdList = await req("/api/admin/bindings", { cookie: C });
   const _activeDemo = (_bdList.json?.rows || []).find((x) => x.user_id === "u-driver-0001" && x.driver_id === "DEMO_D0149" && x.account_status === "active");
@@ -312,7 +318,7 @@ try {
     check("司机 review 权限 → 403", (await req("/api/training-tasks/task-1/review", { method: "POST", cookie: DC, body: { decision: "approved", reason: "x" } })).status === 403);
     check("管理员 review 不存在任务 → 404", (await req("/api/training-tasks/task-x/review", { method: "POST", cookie: C, body: { decision: "approved", reason: "x" } })).status === 404);
     const notesN = (await req("/api/data/admin.notifications?limit=20", { cookie: C })).json?.rows || [];
-    check("通知全部来自真实实体(干预链+团队审核后的真实培训链+复核申请)，无门禁绕过", notesN.every((n) => ["intervention", "training_task", "review_request"].includes(String(n.source_entity_type))) && notesN.some((n) => n.type === "rr_submitted" || notesN.length >= 1));
+    check("通知全部来自真实实体(干预链+团队审核后的真实培训链+复核申请)，无门禁绕过", notesN.every((n) => ["intervention", "training_task", "review_request", "daily_safety_report"].includes(String(n.source_entity_type))) && notesN.some((n) => n.type === "rr_submitted" || notesN.length >= 1));
   }
 
   // --- 第13轮：运行时AI（工具链自检+真实模型+越权拒绝+草稿零写入） ---
@@ -365,7 +371,7 @@ try {
     const mineV = await req("/api/data/my.review_requests?limit=10", { cookie: DC });
     check("司机仅见本人申请且最新一条answered含答复", (mineV.json?.rows || []).length >= 2 && mineV.json.rows[0].status === "answered" && String(mineV.json.rows[0].review_note).includes("经核查"), JSON.stringify({ n: mineV.json?.rows?.length }));
     const vs = await req(`/api/review-requests/${RID}`, { cookie: C });
-    check("管理员核查视图含原快照28.142576（未被改写）", vs.json?.snapshot?.safety_score === 28.142576 && (vs.json?.timeline || []).length >= 4);
+    check("管理员核查视图含原快照28.142576（未被改写；R39起幂等重放不再补审计行，链=create+checking+answered）", vs.json?.snapshot?.safety_score === 28.142576 && (vs.json?.timeline || []).length >= 3 && (vs.json?.timeline || []).some(t => t.action === "review_request.answered"));
     check("司机读不存在id→404", (await req("/api/review-requests/rr-none", { cookie: DC })).status === 404);
     const snap = await req("/api/data/admin.score_snapshots?limit=1&driver_id=DEMO_D0149", { cookie: C });
     check("A09 闭环核验：等级D可信度high原分不变、审计通知增行", snap.json.rows[0].risk_level === "D" && snap.json.rows[0].confidence_level === "high");

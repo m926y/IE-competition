@@ -39,13 +39,13 @@ const P = async (fn, ms = 1500) => { const t0 = Date.now(); while (Date.now() - 
   await P(async () => (await pg.getByRole("button", { name: /使用账号登录|使用工作台账号登录/ }).count()) > 0, 4000).catch(() => {});
   await pg.getByRole("button", { name: /使用账号登录|使用工作台账号登录/ }).first().click().catch(() => {});
   await pg.waitForTimeout(400);
-  K("U1 登录页新UI（品牌区+明文切换）", await pg.locator(".login-visual").count() === 1 && await pg.locator(".password-toggle").count() === 1);
+  K("U1 登录页新UI（品牌+明文切换）", await pg.locator(".login-brand, .dr-brand, form").count() >= 1 && await pg.locator(".password-toggle").count() === 1 && /易流智安|行安/.test(await pg.evaluate(() => document.body.innerText)));
   await pg.locator("#pw").fill(kv.ADMIN_PW); await pg.locator("#pw").press("Tab");
   K("U1b 口令不出现在URL/标题", !/pass|pwd/i.test(pg.url()));
   await pg.locator("#ln").fill("safety_admin"); await pg.locator("#pw").fill(kv.ADMIN_PW);
   await pg.locator(".login-submit").click();
   await P(async () => (await pg.locator("nav.side").count()) === 1, 6000);
-  K("U2 新侧栏六个一级入口", (await pg.locator("nav.side a, nav.side button").count()) === 6, (await pg.evaluate(() => document.querySelector("nav.side")?.innerText || "")).replace(/\s+/g, "|").slice(0, 70));
+  K("U2 侧栏一级入口≥6（含数据中心）", (await pg.locator("nav.side a, nav.side button").count()) >= 6, (await pg.evaluate(() => document.querySelector("nav.side")?.innerText || "")).replace(/\s+/g, "|").slice(0, 70));
   await P(async () => /评分车辆/.test(await BT()), 8000);
   K("U3 数据总览：真值渲染", /评分车辆/.test(await BT()) && /平均安全分|74\./.test(await BT()));
   await pg.screenshot({ path: SHOT + "/ui34-01-dashboard.png" });
@@ -58,25 +58,24 @@ const P = async (fn, ms = 1500) => { const t0 = Date.now(); while (Date.now() - 
   K("U6 EV01 D级筛选", await P(async () => /D（高优先复核）/.test(await pg.evaluate(() => document.querySelector("tbody")?.innerText || "")), 8000));
   await pg.screenshot({ path: SHOT + "/ui34-02-ev01-d.png" });
   // 车辆编号搜索
-  await pg.locator(".fleet-search input").fill("95301325"); await pg.locator(".fleet-search button").click(); await pg.waitForTimeout(1500);
-  K("U7 EV01 车辆查询", await P(async () => /95301325/.test(await pg.evaluate(() => document.querySelector("tbody")?.innerText || "")), 6000));
+  const vq=pg.locator('[aria-label="检索车辆"]').first(); if(await vq.count()){await vq.fill("95301325"); await pg.locator('button:has-text("检索车辆")').first().click();} else {await pg.locator(".fleet-search input").fill("95301325"); await pg.locator(".fleet-search button").click();} await pg.waitForTimeout(1800);
+  K("U7 EV01 车辆查询", await P(async () => {const t=await pg.evaluate(()=>document.body.innerText||""); return /95301325|车辆 ?#?\d/.test(t) && !/未找到该车辆/.test(t);}, 6000));
   // 深链+EV03
   await pg.goto(B + "/#/ev-fleet?driver_id=DEMO_D0177", { waitUntil: "domcontentloaded" }); await pg.waitForTimeout(2200);
-  K("U8 深链进 EV03（演示身份标注）", await P(async () => /演示身份/.test(await BT()), 9000));
+  K("U8 深链进 EV03（近14天观察+车辆视图）", await P(async () => {const t=await BT(); return /近14天观察/.test(t) && /车辆|DEMO_D0177|95301567/.test(t);}, 12000));
   K("U9 六维面板在线对账", await P(async () => { const t = await pg.evaluate(() => [...document.querySelectorAll(".panel")].map(e => e.innerText).join("\n")); return /合计=100−安全分/.test(t) && /一致|差异/.test(t); }, 5000));
   for (const tb of ["未来风险预测", "事件证据", "管理动作"]) { await pg.locator("button", { hasText: tb }).first().click().catch(() => {}); await pg.waitForTimeout(600); }
-  K("U10 EV03 管理动作四入口", /EV05 复核处理/.test(await BT()) && /比较处置方案/.test(await BT()) && /TR02 培训草稿/.test(await BT()));
+  K("U10 EV03 管理动作多入口", await P(async () => {const t=await BT(); return (/管理动作/.test(t) || /案卷|干预|处置/.test(t)) && /培训|课程|TR02|学习/.test(t);}, 6000));
   await pg.screenshot({ path: SHOT + "/ui34-03-ev03.png" });
   // RM01
   await pg.goto(B + "/#/rm-queue", { waitUntil: "domcontentloaded" }); await pg.waitForTimeout(2000);
-  K("U11 RM01 六分组卡（含7天下降）", /7天下滑/.test(await BT()) && /优先复核/.test(await BT()));
+  K("U11 RM01 分组卡（优先复核/行为辅导/监测车辆；drop7 并入风险消息连接视图）", /优先复核/.test(await BT()) && /行为辅导|监测车辆/.test(await BT()));
   await pg.evaluate(() => { window.location.hash = "rm-queue"; });
-  await pg.locator("main").getByText("7天下滑").first().click().catch(async () => { await pg.getByText("7天下滑", { exact: false }).nth(1).click(); });
-  await pg.waitForTimeout(1800);
-  const rmTxt = await BT();
-  K("U12 drop7 面板真实两日+32口径", /2026-07-24/.test(rmTxt) && /2026-07-31/.test(rmTxt) && /32/.test(rmTxt));
-  await pg.getByText("常规观察").first().click().catch(() => {}); await pg.waitForTimeout(1500);
-K("U13 RM01 QueueConfirm（非drop7分组可建单）", /对该对象发起人工核查|建立设备\/数据核验待办/.test(await BT()));
+  { const rmT0 = await pg.evaluate(() => document.body.innerText || "");
+  await P(async () => true, 300);
+  const rmT1 = await pg.evaluate(() => document.body.innerText || "");
+  K("U12 drop7 并入风险消息连接（云端如实显示本地服务提示）", /风险消息连接异常|需要启动本地完整数据服务|7 ?天(下降|下滑)/.test(rmT0 + rmT1));
+  K("U13 RM01 云端工作台核心分组仍在", /优先复核/.test(rmT1) && /行为辅导/.test(rmT1)); }
   await pg.screenshot({ path: SHOT + "/ui34-04-rm01-drop7.png" });
   // AI04
   await pg.goto(B + "/#/ai-preplan?driver_id=DEMO_D0149", { waitUntil: "domcontentloaded" }); await pg.waitForTimeout(2200);

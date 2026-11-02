@@ -16,3 +16,6 @@
 - 公开数据打包只能操作备份副本，不能清理本机正在使用的业务数据库。
 
 修改后执行typecheck与build，按影响范围运行相关测试。路径与发行改动运行tests/distribution.test.mjs；模型改动运行tests/model-duty.test.mjs。数据/集成测试使用临时库，不修改开发者业务状态。不为无关文案反复运行完整数据重算。
+
+## 托管双模说明（2026-11-02 起）
+- `APP_DATA_MODE` 未设（平台托管）时，司机投影与每日简报/学习报告/行动中心走 **Supabase 宿主实现**（DUAL 分发）；`=full`（本地完整数据工作台）走集成分机。修改 `server/daily-report/`、`server/driver-actions.mjs` 时两模式同时生效，回归至少覆盖云端矩阵（BASE=r34/r37/r40 电池）。

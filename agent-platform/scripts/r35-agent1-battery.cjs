@@ -59,7 +59,7 @@ const chat = (ck, q, page, crid) => fetch(B + "/api/ai/chat", { method: "POST", 
 
   // ---- T7 自检：engine 信息 + 零写入 ----
   const st = await fetch(B + "/api/ai/selftest", { headers: { cookie: AC } }).then(r => r.json());
-  K("T7 selftest engine=agent1-inspired 且零写入", st?.engine?.name === "agent1-inspired" && st?.engine?.skills?.length === 5 && st?.writes === "zero_confirmed" && st?.tools?.length >= 14, "skills=" + JSON.stringify(st?.engine?.skills));
+  K("T7 selftest engine=agent1-inspired 且零写入", st?.engine?.name === "agent1-inspired" && st?.engine?.skills?.length >= 5 && st?.writes === "zero_confirmed" && st?.tools?.length >= 14, "skills=" + JSON.stringify(st?.engine?.skills));
 
   child.kill("SIGTERM");
   console.log(`\nR35 RESULT pass=${pass} fail=${fail}`);

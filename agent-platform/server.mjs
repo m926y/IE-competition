@@ -2,6 +2,12 @@ import {parseCourse,validateCourse,gradeCourse} from './server/editable-course.m
 import {createLearningAssets} from './server/learning-assets.mjs';
 // Crazy Logi-AI 2.0 驾驶安全管理工作台 — QW Pages dynamic entrypoint.
 // 单文件服务端：认证、授权、数据库访问、审计。零运行时依赖（仅 Node 22 内置模块 + fetch）。
+import { readDriverFacts } from "./server/daily-report/data-reader.mjs";
+import { computeDriverSnapshot } from "./server/daily-report/safety-analyzer.mjs";
+import { organizeDailyReport } from "./server/daily-report/report-agent.mjs";
+import { validateDailySafetyReport } from "./server/daily-report/report-validator.mjs";
+import { allowedNumberStrings, verifyNarrative, personalizerMessages } from "./server/daily-report/report-personalizer.mjs";
+import { actionCenter, scoreComparison, fleetStatistics, readAll } from "./server/driver-actions.mjs";
 import {RISK_RULES} from "./server/risk-monitor.mjs";
 import { createServer } from "node:http";
 import { readFile, stat } from "node:fs/promises";
@@ -116,6 +122,7 @@ function readBodyRaw(request, limitBytes = 64 * 1024) {
 const BROKER_URL = "http://127.0.0.1:9001";
 const BROKER_PLACEHOLDER_KEY = "qwenwork-runtime-broker";
 const SAFE_DATABASE_OPERATIONS = new Set([
+  "dsr_q", "dsr_i", "dsr_u", "drj_q", "drj_i", "drj_u", "dsg_q", "dsg_i", "dsg_u", "dau_q", "dne_q",
   "list_users", "get_user_by_name", "get_user_by_id", "touch_login",
   "create_session", "get_session", "delete_session",
   "get_binding_by_platform_user", "insert_audit", "list_audit",
@@ -3544,8 +3551,17 @@ async function evidenceCheckCore(ref, ctx) {
   const NOLEAK = { error: "not_found_or_stale", hint: "记录不存在、已失效或超出授权——不透露受限记录的存在性；请重新向 AI 查询（卡片数据不缓存）" };
   const sanitize = (s2) => String(s2).slice(0, 42).replace(/[^\w:.\-]/g, "_");
   if(kind==='daily_report'){
-    if(!/^[1-9][0-9]{0,9}$/.test(id))return {code:404,payload:NOLEAK};
-    try{const saved=await integratedRPC('driver','agentReport',ctx.principal,{id:Number(id)});if(!saved)return {code:404,payload:NOLEAK};return {code:200,payload:{ok:true,ref,reauthorized:'server_session',route:user.role==='driver'?'driver:report?report='+id:'#/daily-reports?report='+id,fresh:{report_date:saved.report.reportDate,as_of_date:saved.report.metrics.personalScoreDate,report_version:saved.reportVersion}}}}catch{return {code:404,payload:NOLEAK}};
+    if(!/^[1-9]\d{0,9}$/.test(id)) return {code:404,payload:NOLEAK};
+    if(process.env.APP_DATA_MODE==='full'){
+      try{ const saved=await integratedRPC('driver','agentReport',ctx.principal,{id:Number(id)}); if(!saved) return {code:404,payload:NOLEAK}; return {code:200,payload:{ok:true,ref,reauthorized:'server_session',route:user.role==='driver'?('driver:report?report='+id):('#/daily-reports?report='+id),fresh:{report_date:saved.report?.reportDate,as_of_date:saved.report?.metrics?.personalScoreDate||null,report_version:saved.reportVersion}}}; }catch{ return {code:404,payload:NOLEAK}; }
+    }
+    const q={ id:`eq.${id}`, select:"id,driver_id,report_date,report_version,published_at,report_json", limit:1 };
+    if(user.role==='driver'){ if(!user.driver_id) return {code:404,payload:NOLEAK}; q.driver_id=`eq.${user.driver_id}`; }
+    const row=(await dbRequest('dsr_q','GET','daily_safety_reports',{query:q})).data?.[0];
+    if(!row) return {code:404,payload:NOLEAK};
+    if(user.role!=='driver' && String(user.fleet_scope||'*')!=='*'){ try{ await assertInScope(ctx.principal,{driverId:row.driver_id}); }catch{ return {code:404,payload:NOLEAK}; } }
+    let rp=null; try{ rp=JSON.parse(row.report_json); }catch{}
+    return {code:200,payload:{ok:true,ref,reauthorized:'server_session',route:user.role==='driver'?('driver:report?report='+row.id):('#/daily-reports?report='+row.id),fresh:{report_date:row.report_date,as_of_date:rp?.metrics?.personalScoreDate||null,report_version:Number(row.report_version)}}};
   }
   const TABLE_KEY = { score: ["score_snapshots", "score_id"], score_history: ["score_history", "score_id"], risk: ["risk_snapshots", "snapshot_id"], ledger: ["deduction_ledger", "ledger_id"], queue: ["review_queue", "queue_id"], alert: ["alerts", "alert_id"], knowledge: ["knowledge_articles", "article_id"], course: ["training_courses", "course_id"] };
   const def = TABLE_KEY[kind];
@@ -3639,6 +3655,405 @@ async function aiGetConfirmStatus(callIds) {
 
 // ---------- Agent reports, scoped analytics and confirmed batch operations ----------
 async function handleDuty(request,response,url,ctx,forced){const u=requireUser(ctx.principal),t=resolveDbTarget(),input=request.method==='GET'?Object.fromEntries(url.searchParams):await readBody(request);const r=await fetch(t.url+'/internal/duty/'+(forced|| (request.method==='GET'?'history':'record')),{method:'POST',headers:{apikey:t.key,'content-type':'application/json'},body:JSON.stringify({...input,actor:{id:u.user_id}})});const data=await r.json();if(!r.ok)throw new HttpError(r.status,data.error);sendJson(response,200,data);}
+function requireVerifiedDriver(principal) {
+  const user = requireUser(principal);
+  if (user.role !== "driver") throw new HttpError(403, "forbidden");
+  if (!user.driver_id) throw new HttpError(409, "binding_required");
+  if (!user.binding_verified) throw new HttpError(403, "binding_not_verified");
+  return user;
+}
+
+const dailyBusinessDate = () => new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());
+const validDailyDate = value => typeof value==='string' && /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(value)) && new Date(value).toISOString().slice(0,10)===value;
+async function dailyReportStore(method,params={}) {
+  if (process.env.IE_LOCAL_SOURCE_ONLY === '1') {
+    const target=resolveDbTarget();
+    let result;
+    try {
+      const query=method==='GET'?'?'+new URLSearchParams(params):'';
+      result=await fetch(`${target.url}/internal/daily-reports${query}`,{method,headers:{apikey:target.key,'content-type':'application/json'},body:method==='POST'?JSON.stringify(params):undefined});
+    } catch { throw new HttpError(503,'daily_report_store_unavailable'); }
+    let payload;try{payload=await result.json();}catch{throw new HttpError(503,'daily_report_store_unavailable');}
+    if (!result.ok) throw new HttpError(result.status===404?404:result.status===409?409:result.status===400?400:503,payload.code||'daily_report_store_unavailable');
+    return payload;
+  }
+  return hostDailyStore(method, params);
+}
+// ===== R40 宿主每日简报：与本地 report-store 同协议的 PostgreSQL 实现（引擎模块 server/daily-report/* 两边共用） =====
+let dailyPreload=null, dailyPreloadAt=0, dailyPreloadPromise=null;
+async function grabAll(op, table, select, order) {
+  const out=[];
+  for (let off=0; off<60000; off+=2000) {
+    const r = await dbRequest(op, "GET", table, { query: { select, order: order || undefined, limit: 2000, offset: off } });
+    const rows = r.data || []; out.push(...rows); if (rows.length<2000) break;
+  }
+  return out;
+}
+async function dailyFactsStore() {
+  if (dailyPreload && Date.now()-dailyPreloadAt < 90000) return dailyPreload;
+  if (dailyPreloadPromise) return dailyPreloadPromise;
+  dailyPreloadPromise = (async () => {
+    const [drivers, history, snapshots, events, courses, ledger] = await Promise.all([
+      grabAll("dsr_q","drivers","driver_id,gpsno,fleet_id,mapping_start,mapping_end","driver_id.asc"),
+      grabAll("dsr_q","score_history","score_id,driver_id,gpsno,as_of_date,safety_score,risk_level,confidence_level,score_status,score_method,source_version,window_start","score_id.asc"),
+      grabAll("dsr_q","score_snapshots","score_id,driver_id,gpsno,as_of_date,safety_score,risk_level,confidence_level,score_status,score_method,source_version,window_start,recommended_action,primary_risk_dimension","score_id.asc"),
+      grabAll("dsr_q","replay_events","event_id,gpsno,driver_id,event_time,event_type,event_name,dimension,replay_date,is_replay,source_version","event_id.asc"),
+      grabAll("dsr_q","training_courses","course_id,title,dimension,content_status,version_no,source_version,updated_at","course_id.asc"),
+      grabAll("dsr_q","deduction_ledger","ledger_id,gpsno,dimension,event_type,event_count,allocated_points,dimension_points,as_of_date,source_version","ledger_id.asc"),
+    ]);
+    dailyPreload = { drivers, score_history: history, score_snapshots: snapshots, replay_events: events, training_courses: courses, deduction_ledger: ledger };
+    dailyPreloadAt = Date.now(); dailyPreloadPromise = null; return dailyPreload;
+  })().catch(e => { dailyPreloadPromise = null; throw e; });
+  return dailyPreloadPromise;
+}
+function hostDailyStoreAdapter(data) {
+  const map = { drivers: data.drivers, score_history: data.score_history, score_snapshots: data.score_snapshots, replay_events: data.replay_events, training_courses: data.training_courses, deduction_ledger: data.deduction_ledger };
+  return { rows: name => map[name] || [], sourceHash: "hosted_postgres" };
+}
+const dailyParse = row => row ? { id:Number(row.id), reportVersion:Number(row.report_version), publishedAt:row.published_at, report:JSON.parse(row.report_json) } : null;
+function dailyReportRows(rows){ return rows.map(row=>({id:Number(row.id),reportDate:row.report_date,reportVersion:Number(row.report_version),isCurrent:row.is_current===true||row.is_current==='true',publishedAt:row.published_at,title:(()=>{try{return JSON.parse(row.report_json).title;}catch{return '';}})()})); }
+function dailyGoalRows(rows){ return rows.map(row=>({id:Number(row.id),reportId:Number(row.report_id),previousGoalId:row.previous_goal_id?Number(row.previous_goal_id):null,type:row.goal_type,description:row.goal_text,status:row.status,feedbackCode:row.feedback_code||null,feedbackText:row.feedback_text||null,updatedAt:row.updated_at||null,createdAt:row.created_at})); }
+async function previousGoalContextHost(driverId, reportDate) {
+  const rs = await dbRequest("dsr_q","GET","daily_safety_reports",{ query:{ driver_id:`eq.${driverId}`, report_date:`lt.${reportDate}`, status:'eq.published', is_current:'eq.true', select:"id,report_date,report_json", order:"report_date.desc", limit:1 } });
+  const prev = rs.data?.[0]; if (!prev) return null;
+  const g = await dbRequest("dsg_q","GET","driver_safety_goals",{ query:{ report_id:`eq.${prev.id}`, select:"id,status,feedback_code", limit:1 } });
+  const goal = g.data?.[0] || null; let parsed = {}; try { parsed = JSON.parse(prev.report_json); } catch {}
+  return { id: goal?Number(goal.id):null, reportDate: prev.report_date, status: goal?.status || "active", feedbackCode: goal?.feedback_code || null,
+    scoreEvidenceId: parsed?.metrics?.scoreEvidenceId || null, eventType: parsed?.risks?.[0]?.eventType || null, evidenceRefs: parsed?.risks?.[0]?.evidenceRefs || [] };
+}
+const DAILY_NARRATIVE_PROMPT_VERSION = sha256hex("daily-report-personalizer-v1").slice(0, 12);
+function dailyGreeting() { const h = Number(new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Shanghai', hour: '2-digit', hour12: false }).format(new Date())); return h < 5 ? '凌晨好' : h < 11 ? '早上好' : h < 14 ? '中午好' : h < 18 ? '下午好' : '晚上好'; }
+async function dailyNarrate(report, snapshot, actorHint) {
+  const allow = allowedNumberStrings(report, snapshot);
+  const hint = { greeting: dailyGreeting(), feedbackCode: report.goalTracking?.previousFeedbackCode || null };
+  let repair = null; const diag = [];
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let narrative = null;
+    try {
+      const j = await aiUpstream({ model: aiModel(), messages: personalizerMessages(report, snapshot, hint, repair), temperature: 0.4, max_tokens: 1100 });
+      const content = String(j?.choices?.[0]?.message?.content || '').trim().replace(/^```(json)?/i, '').replace(/```$/i, '').trim();
+      narrative = JSON.parse(content.slice(content.indexOf('{'), content.lastIndexOf('}') + 1));
+    } catch (e) { diag.push('parse_or_call:' + String((e && e.code) || e?.message || 'network').slice(0, 60)); repair = '上一稿无效 JSON/调用失败。只输出纯 JSON。'; continue; }
+    const verdict = verifyNarrative(narrative, report, allow);
+    if (verdict.ok) return { narrative, meta: { generatedBy: 'ai', model: aiModel(), prompt_version: DAILY_NARRATIVE_PROMPT_VERSION, attempts: attempt + 1, ai_status: attempt ? 'ok_after_repair' : 'ok', ...actorHint }, allowSize: allow.size };
+    diag.push('verify:' + verdict.errors.slice(0, 8).join('|'));
+    if (verdict.errors.some(x => String(x).startsWith('number:'))) diag.push('sample:' + JSON.stringify(narrative).slice(0, 240));
+    repair = '数字/证据/措辞校验失败：' + verdict.errors.slice(0, 6).join('、') + '。数字只能用输入中出现过的原值，禁止百分比与实时措辞，证据引用必须原样来自 facts。';
+  }
+  return { narrative: null, meta: { generatedBy: 'fallback_template', model: aiModel(), prompt_version: DAILY_NARRATIVE_PROMPT_VERSION, ai_status: 'fallback_template', diag, ...actorHint } };
+}
+async function generateDailyReportCore(driverId, reportDate) {
+  const data = await dailyFactsStore();
+  const store = hostDailyStoreAdapter(data);
+  const asOf = new Date(Date.parse(reportDate+'T00:00:00Z')-86400000).toISOString().slice(0,10);
+  const facts = readDriverFacts(store, driverId, asOf);
+  const snapshot = { ...computeDriverSnapshot(facts), previousGoal: await previousGoalContextHost(driverId, reportDate) };
+  return validateDailySafetyReport(organizeDailyReport(snapshot, reportDate), snapshot);
+}
+async function hostPublishDailyReport({driverId,reportDate,actorId,actorRole='safety_admin',revise=false,jobClaim=null}) {
+  const report = await generateDailyReportCore(driverId, reportDate); // 确定性核心：不调模型
+  const finishJob = async () => { if (jobClaim) { try { await dbRequest("drj_u","PATCH","daily_report_jobs",{ query:{ id:`eq.${jobClaim.id}`, lease_token:`eq.${jobClaim.leaseToken}` }, body:{ status:'succeeded', finished_at: nowIso(), lease_token:null, lease_until:null, next_at:0, error_message:null }, headers:{ Prefer:'return=minimal' } }); } catch {} } };
+  const cur = await dbRequest("dsr_q","GET","daily_safety_reports",{ query:{ driver_id:`eq.${driverId}`, report_date:`eq.${reportDate}`, is_current:'eq.true', status:'eq.published', select:"id,report_version,report_json,published_at,source_fingerprint,is_current", limit:1 } });
+  const current = cur.data?.[0] || null;
+  if (current && current.source_fingerprint === report.sourceFingerprint) { await finishJob(); return { ...dailyParse({ ...current, report_version:current.report_version }), idempotentReplay:true, notificationCount:0 }; }
+  if (current && !revise) throw new HttpError(409, "report_revision_required");
+  if (aiAvailable()) { // 仅确需发布新版本时才调用模型（幂等/409 路径零模型消耗）；数字/证据/措辞三重守门，不过关回落规则模板并在 meta 如实标注
+    try { const { narrative, meta } = await dailyNarrate(report, null, {}); if (narrative) report.narrative = narrative; report.narrativeMeta = meta; }
+    catch (e) { report.narrativeMeta = { generatedBy: 'fallback_template', ai_status: 'fallback_error', reason: String((e && e.code) || e?.message || 'e').slice(0, 60) }; }
+  }
+  const maxv = await dbRequest("dsr_q","GET","daily_safety_reports",{ query:{ driver_id:`eq.${driverId}`, report_date:`eq.${reportDate}`, select:"report_version", order:"report_version.desc", limit:1 } });
+  const version = (Number(maxv.data?.[0]?.report_version) || 0) + 1;
+  const at = nowIso();
+  if (current) { const flip = await dbRequest("dsr_u","PATCH","daily_safety_reports",{ query:{ id:`eq.${current.id}`, is_current:'eq.true' }, body:{ is_current:false }, headers:{ Prefer:'return=minimal' } }); if (flip.status && flip.status>=400) throw new HttpError(409,"report_revision_conflict"); }
+  const ins = await dbRequest("dsr_i","POST","daily_safety_reports",{ body:[{ driver_id:driverId, report_date:reportDate, report_version:version, status:'published', is_current:true, data_as_of:report.dataAsOf, source_fingerprint:report.sourceFingerprint, report_json:JSON.stringify(report), published_at:at }], headers:{ Prefer:'return=representation' } }).catch(async e => {
+    if (e instanceof HttpError && (e.status===409||String(e.code).includes('duplicate'))) { const re = await dbRequest("dsr_q","GET","daily_safety_reports",{ query:{ driver_id:`eq.${driverId}`, report_date:`eq.${reportDate}`, is_current:'eq.true', select:"id,report_version,report_json,published_at", limit:1 } }); if (re.data?.[0]) { await finishJob(); return { __replay: re.data[0] }; } }
+    throw e;
+  });
+  if (ins?.__replay) return { ...dailyParse(ins.__replay), idempotentReplay:true, notificationCount:0 };
+  const inserted = ins.data?.[0] || null;
+  const reportId = inserted ? Number(inserted.id) : (await dbRequest("dsr_q","GET","daily_safety_reports",{ query:{ driver_id:`eq.${driverId}`, report_date:`eq.${reportDate}`, report_version:`eq.${version}`, select:"id", limit:1 } })).data?.[0]?.id;
+  const reportView = { id:reportId, reportVersion:version, publishedAt:at, report };
+  if (report.dailyGoal) {
+    const exg = await dbRequest("dsg_q","GET","driver_safety_goals",{ query:{ report_id:`eq.${reportId}`, select:"id", limit:1 } });
+    if (!exg.data?.length) await dbRequest("dsg_i","POST","driver_safety_goals",{ body:[{ driver_id:driverId, report_id:reportId, previous_goal_id:report.goalTracking?.previousGoalId || null, goal_type:report.dailyGoal.type, goal_text:report.dailyGoal.description, status:'active', created_at:at }], headers:{ Prefer:'resolution=ignore,return=minimal' } }).catch(()=>{});
+  }
+  const recips = (await dbRequest("dau_q","GET","app_users",{ query:{ driver_id:`eq.${driverId}`, role:'eq.driver', account_status:'eq.active', binding_verified:'eq.true', select:"user_id", limit:10 } })).data || [];
+  let notes = 0;
+  for (const acct of recips) { try { await notify(acct.user_id, "daily_report_ready", String(reportId), `${reportDate} 的历史安全简报已可查看。`, `daily_report_ready:${driverId}:${reportDate}:${version}:${acct.user_id}`, "daily_safety_report", "每日安全简报已生成"); notes++; } catch {} }
+  await appendAudit({ user:{ user_id:actorId, role:actorRole } }, "daily_report.publish", "daily_safety_report", String(reportId), current?"published":null, "published", null, [], { driver_id:driverId, report_date:reportDate, report_version:version, source_fingerprint:report.sourceFingerprint });
+  await finishJob();
+  return { ...reportView, idempotentReplay:false, notificationCount:notes };
+}
+async function hostListJobs({date,limit,offset,fleetId,status}) {
+  const q = { report_date:`eq.${date}`, select:"id,driver_id,report_date,status,attempts,started_at,finished_at,error_message", order:"id.asc", limit:Number(limit)||50, offset:Number(offset)||0 };
+  if (status) q.status = `eq.${status}`;
+  const sumQ = { report_date:`eq.${date}`, select:"id,status,driver_id", order:"id.asc", limit:2000 };
+  const [page, all] = await Promise.all([
+    dbRequest("drj_q","GET","daily_report_jobs",{ query:q }),
+    dbRequest("drj_q","GET","daily_report_jobs",{ query:sumQ }),
+  ]);
+  let rows = (all.data||[]);
+  if (fleetId && fleetId !== "*") { const data = await dailyFactsStore(); const inFleet = new Set(data.drivers.filter(d=>String(d.fleet_id)===String(fleetId)).map(d=>String(d.driver_id))); rows = rows.filter(r=>inFleet.has(String(r.driver_id))); }
+  const byStatus = {}; for (const r of rows) byStatus[r.status]=(byStatus[r.status]||0)+1;
+  const pageRows = status ? rows.slice(Number(offset)||0,(Number(offset)||0)+(Number(limit)||50)) : (page.data||[]).slice(0, Number(limit)||50);
+  return { date, total: rows.length, byStatus, rows: pageRows.map(r=>({ id:Number(r.id), driver_id:r.driver_id, report_date:r.report_date, status:r.status, attempts:Number(r.attempts)||0, started_at:r.started_at||null, finished_at:r.finished_at||null, error_message:r.error_message||null })), limit:Number(limit)||50, offset:Number(offset)||0 };
+}
+async function hostDailyStore(method, params={}) {
+  if (method==='POST' && params.action==='publish') return hostPublishDailyReport({ driverId: String(params.driverId||''), reportDate: params.reportDate, actorId: String(params.actorId||''), revise: params.revise===true });
+  if (method==='POST' && params.action==='feedback') {
+    const gid = Number(params.goalId); if (!Number.isSafeInteger(gid)||gid<1) throw new HttpError(400,"invalid_goal_id");
+    const code = String(params.code||''), text = String(params.text??'').slice(0,500);
+    if (!['will_review','need_help','dismissed'].includes(code)) throw new HttpError(400,"invalid_goal_feedback");
+    const row = (await dbRequest("dsg_q","GET","driver_safety_goals",{ query:{ id:`eq.${gid}`, driver_id:`eq.${params.driverId}`, select:"id,status,feedback_code,feedback_text,updated_at", limit:1 } })).data?.[0];
+    if (!row) throw new HttpError(404,"not_found");
+    if (row.feedback_code===code && (row.feedback_text||'')===text) return { id:gid, status:row.status, feedbackCode:code, updatedAt:row.updated_at, idempotentReplay:true };
+    const at = nowIso(), status = code==='dismissed' ? 'dismissed' : 'active';
+    await dbRequest("dsg_u","PATCH","driver_safety_goals",{ query:{ id:`eq.${gid}`, driver_id:`eq.${params.driverId}` }, body:{ status, feedback_code:code, feedback_text:text, updated_at:at }, headers:{ Prefer:'return=minimal' } });
+    await appendAudit({ user:{ user_id:String(params.actorId||params.driverId), role:'driver' } }, "daily_goal.feedback", "driver_safety_goal", String(gid), row.status, status, null, [], { feedback_code:code });
+    return { id:gid, status, feedbackCode:code, updatedAt:at, idempotentReplay:false };
+  }
+  if (method==='GET') {
+    const kind = params.kind;
+    if (kind==='jobs') return hostListJobs({ date:params.date, limit:params.limit, offset:params.offset, fleetId:params.fleet_id, status:params.status });
+    const driverId = String(params.driver_id||'');
+    if (!/^([\w.-]{1,100})$/.test(driverId)) throw new HttpError(400,"invalid_driver_id");
+    if (kind==='today') { const row = (await dbRequest("dsr_q","GET","daily_safety_reports",{ query:{ driver_id:`eq.${driverId}`, report_date:`eq.${params.date}`, is_current:'eq.true', status:'eq.published', select:"id,report_version,report_json,published_at", limit:1 } })).data?.[0]; if (!row) throw new HttpError(404,"not_found"); return dailyParse(row); }
+    if (kind==='detail') { const row = (await dbRequest("dsr_q","GET","daily_safety_reports",{ query:{ id:`eq.${params.id}`, driver_id:`eq.${driverId}`, status:'eq.published', select:"id,report_version,report_json,published_at", limit:1 } })).data?.[0]; if (!row) throw new HttpError(404,"not_found"); return dailyParse(row); }
+    if (kind==='history') {
+      const limit = Math.min(Math.max(Number(params.limit)||20,1),50), offset = Math.max(Number(params.offset)||0,0);
+      const r = await dbRequest("dsr_q","GET","daily_safety_reports",{ query:{ driver_id:`eq.${driverId}`, status:'eq.published', select:"id,report_date,report_version,is_current,published_at,report_json", order:"report_date.desc,report_version.desc", limit, offset }, headers:{ Prefer:"count=exact" } });
+      return { rows: dailyReportRows(r.data||[]), total: (r.rangeHeader ? Number(String(r.rangeHeader).split('/')[1]) : (r.data||[]).length) || (r.data||[]).length, limit, offset };
+    }
+    if (kind==='goals') { const rows = (await dbRequest("dsg_q","GET","driver_safety_goals",{ query:{ driver_id:`eq.${driverId}`, select:"id,report_id,previous_goal_id,goal_type,goal_text,status,feedback_code,feedback_text,updated_at,created_at", order:"created_at.desc,id.desc", limit:100 } })).data||[]; return { rows: dailyGoalRows(rows) }; }
+    if (kind==='notifications') {
+      const reports = (await dbRequest("dsr_q","GET","daily_safety_reports",{ query:{ driver_id:`eq.${driverId}`, status:'eq.published', select:"id", order:"id.desc", limit:100 } })).data||[];
+      const ids = new Set(reports.map(x=>String(x.id)));
+      const rows = (await dbRequest("dne_q","GET","notification_events",{ query:{ target_user_id:`eq.${params.user_id}`, type:'eq.daily_report_ready', select:"notification_id,source_entity_type,source_entity_id,type,title,content,created_at,read_at", order:"created_at.desc", limit:50 } })).data||[];
+      return { rows: rows.filter(r=>r.source_entity_type==='daily_safety_report' && ids.has(String(r.source_entity_id))).map(r=>({ notification_id:r.notification_id, source_entity_id:r.source_entity_id, type:r.type, title:r.title||'每日安全简报已生成', content:r.content, created_at:r.created_at, read_at:r.read_at||null })) };
+    }
+  }
+  throw new HttpError(400,"invalid_daily_report_request");
+}
+const dailyLazyAt=new Map();
+let dailyTickBusy=false;
+const dailyPublishDue = () => { const hm=new Intl.DateTimeFormat('en-GB',{timeZone:'Asia/Shanghai',hour:'2-digit',minute:'2-digit',hour12:false}).format(new Date()); return hm >= (process.env.IE_DAILY_REPORT_AT || "07:00"); };
+async function ensureDailyJobsForDate(date, driverIds) {
+  for (const id of driverIds) { if (!id) continue;
+    const ex = await dbRequest("drj_q","GET","daily_report_jobs",{ query:{ driver_id:`eq.${id}`, report_date:`eq.${date}`, select:"id", limit:1 } });
+    if (!ex.data?.length) { try { await dbRequest("drj_i","POST","daily_report_jobs",{ body:[{ driver_id:id, report_date:date, status:'pending', attempts:0, next_at:0 }], headers:{ Prefer:'resolution=ignore,return=minimal' } }); } catch {} }
+  }
+}
+async function dailyTick(force=false) {
+  if (process.env.IE_LOCAL_SOURCE_ONLY==='1') return; // 本地工作台由自身 scheduler 驱动
+  if (dailyTickBusy) return; if (!force && !dailyPublishDue()) return; dailyTickBusy=true;
+  try {
+    const date=dailyBusinessDate();
+    const accts=(await dbRequest("dau_q","GET","app_users",{ query:{ role:'eq.driver', account_status:'eq.active', binding_verified:'eq.true', driver_id:'not.is.null', select:"driver_id", limit:500 } })).data||[];
+    const targets=[...new Set(accts.map(x=>x.driver_id).filter(Boolean))];
+    await ensureDailyJobsForDate(date, targets);
+    const stale=(await dbRequest("drj_q","GET","daily_report_jobs",{ query:{ report_date:'eq.'+date, status:'eq.running', select:"id,lease_until", limit:200 } })).data||[];
+    for (const j of stale) { if (Number(j.lease_until) && Number(j.lease_until) < Date.now()-30000) { await dbRequest("drj_u","PATCH","daily_report_jobs",{ query:{ id:'eq.'+j.id, status:'eq.running' }, body:{ status:'pending', lease_token:null, lease_until:null, next_at:Date.now()+60000 }, headers:{ Prefer:'return=minimal' } }).catch(()=>{}); } }
+    const pend=(await dbRequest("drj_q","GET","daily_report_jobs",{ query:{ report_date:'eq.'+date, status:'eq.pending', next_at:'lte.'+Date.now(), select:"id,driver_id,report_date,attempts", order:"id.asc", limit:25 } })).data||[];
+    const leaseTok=newId('lease');
+    for (const j of pend) {
+      if (Number(j.attempts)>=5) { await dbRequest("drj_u","PATCH","daily_report_jobs",{ query:{ id:'eq.'+j.id, status:'eq.pending' }, body:{ status:'failed', error_message:'max_attempts', finished_at:nowIso() }, headers:{ Prefer:'return=minimal' } }).catch(()=>{}); continue; }
+      const cl=await dbRequest("drj_u","PATCH","daily_report_jobs",{ query:{ id:'eq.'+j.id, status:'eq.pending', attempts:'eq.'+j.attempts }, body:{ status:'running', attempts:Number(j.attempts)+1, lease_token:leaseTok, lease_until:Date.now()+600000, started_at:nowIso(), next_at:0, error_message:null }, headers:{ Prefer:'return=representation' } });
+      if (!cl.data?.length) continue;
+      try { await hostPublishDailyReport({ driverId:j.driver_id, reportDate:j.report_date, actorId:'system:scheduler', actorRole:'system', revise:false, jobClaim:{ id:j.id, leaseToken:leaseTok } }); }
+      catch (e) { const code=String(e?.code||e?.message||'publish_error').slice(0,80);
+        const terminal = code==='report_revision_required' || code==='driver_not_found_or_ambiguous' || code==='not_found';
+        await dbRequest("drj_u","PATCH","daily_report_jobs",{ query:{ id:'eq.'+j.id, lease_token:'eq.'+leaseTok }, body: terminal ? { status:'failed', error_message:code, finished_at:nowIso(), lease_token:null, lease_until:null, next_at:0 } : { status:'pending', error_message:code, lease_token:null, lease_until:null, next_at:Date.now()+300000*(Number(j.attempts)+1) }, headers:{ Prefer:'return=minimal' } }).catch(()=>{});
+      }
+    }
+  } catch (e) { console.error("daily_tick_error", String(e?.code||e).slice(0,120)); } finally { dailyTickBusy=false; }
+}
+
+async function handleDailyReportRun(request,response,url,ctx) {
+  const user=requireUser(ctx.principal);
+  if (user.role!=='safety_admin') throw new HttpError(403,'forbidden');
+  const body=await readBody(request);
+  const driverId=String(body.driver_id||'');
+  const reportDate=body.report_date||dailyBusinessDate();
+  if (!/^[\w.-]{1,100}$/.test(driverId)||!validDailyDate(reportDate)||reportDate>dailyBusinessDate()||typeof body.revise!=='undefined'&&typeof body.revise!=='boolean') throw new HttpError(400,'invalid_daily_report_request');
+  const driver=(await dbRequest('list_resource','GET','drivers',{query:{driver_id:`eq.${driverId}`,select:'driver_id,fleet_id',limit:1}})).data?.[0];
+  if (!driver) throw new HttpError(404,'not_found');
+  await assertInScope(ctx.principal,{driverId});
+  sendJson(response,200,await dailyReportStore('POST',{action:'publish',driverId,reportDate,actorId:user.user_id,revise:body.revise===true}));
+}
+async function handleDailyReportJobs(request,response,url,ctx) {
+  const user=requireUser(ctx.principal);
+  if(user.role!=='safety_admin') throw new HttpError(403,'forbidden');
+  const date=url.searchParams.get('date')||dailyBusinessDate(),limit=url.searchParams.get('limit')||'50',offset=url.searchParams.get('offset')||'0',status=url.searchParams.get('status');
+  if(!validDailyDate(date)||date>dailyBusinessDate()||!/^[1-9]\d*$/.test(limit)||Number(limit)>100||!/^\d+$/.test(offset)||!Number.isSafeInteger(Number(offset))||status!==null&&!['pending','running','succeeded','failed'].includes(status)) throw new HttpError(400,'invalid_job_query');
+  const fleetId=String(user.fleet_scope||'*');
+  sendJson(response,200,await dailyReportStore('GET',{kind:'jobs',date,limit,offset,...(status?{status}:{}),...(fleetId==='*'?{}:{fleet_id:fleetId})}));
+}
+async function handleDailyReportToday(request,response,url,ctx) {
+  const user=requireVerifiedDriver(ctx.principal);
+  const date=dailyBusinessDate();
+  let report=null;
+  try{report=await dailyReportStore('GET',{kind:'today',driver_id:user.driver_id,date});}catch(error){if(!(error instanceof HttpError&&error.status===404))throw error;}
+  if (!report && process.env.IE_LOCAL_SOURCE_ONLY!=='1' && dailyPublishDue()) { // 宿主惰性补偿：到点后首次访问即生成（每司机+日期 30s 节流；无人访问/实例冷启动时由定时器补）
+    const key=user.driver_id+":"+date; const last=dailyLazyAt.get(key)||0;
+    if (Date.now()-last>30000) { dailyLazyAt.set(key,Date.now());
+      try { await ensureDailyJobsForDate(date, [user.driver_id]); await hostPublishDailyReport({driverId:user.driver_id,reportDate:date,actorId:'system:scheduler',actorRole:'system',revise:false});
+        await dbRequest("drj_u","PATCH","daily_report_jobs",{ query:{ driver_id:`eq.${user.driver_id}`, report_date:`eq.${date}`, status:'in.(pending,running)' }, body:{ status:'succeeded', finished_at:nowIso(), error_message:null }, headers:{ Prefer:'return=minimal' } }).catch(()=>{}); report=(await dbRequest("dsr_q","GET","daily_safety_reports",{ query:{ driver_id:`eq.${user.driver_id}`, report_date:`eq.${date}`, is_current:'eq.true', status:'eq.published', select:"id,report_version,report_json,published_at", limit:1 } })).data?.[0]||null; if(report) report=dailyParse(report); } catch (e) { if (!(e instanceof HttpError && ["report_revision_required"].includes(e.code))) console.error("daily_lazy_error", user.driver_id, String(e?.code||e).slice(0,60)); }
+    }
+  }
+  sendJson(response,200,report);
+}
+async function handleDailyReportHistory(request,response,url,ctx) {
+  const user=requireVerifiedDriver(ctx.principal);
+  const limit=url.searchParams.get('limit')||'20',offset=url.searchParams.get('offset')||'0';
+  if (!/^\d+$/.test(limit)||Number(limit)<1||Number(limit)>50||!/^\d+$/.test(offset)||!Number.isSafeInteger(Number(offset))) throw new HttpError(400,'invalid_pagination');
+  sendJson(response,200,await dailyReportStore('GET',{kind:'history',driver_id:user.driver_id,limit,offset}));
+}
+async function handleDailyReportDetail(request,response,url,ctx) {
+  const user=requireVerifiedDriver(ctx.principal),id=url.pathname.slice('/api/driver/reports/'.length);
+  if (!/^[1-9]\d*$/.test(id)||!Number.isSafeInteger(Number(id))) throw new HttpError(404,'not_found');
+  sendJson(response,200,await dailyReportStore('GET',{kind:'detail',driver_id:user.driver_id,id}));
+}
+async function handleDailySafetyGoals(request,response,url,ctx) {
+  const user=requireVerifiedDriver(ctx.principal);
+  sendJson(response,200,await dailyReportStore('GET',{kind:'goals',driver_id:user.driver_id}));
+}
+async function handleDailyGoalFeedback(request,response,url,ctx) {
+  const user=requireVerifiedDriver(ctx.principal),match=/^\/api\/driver\/safety-goals\/([1-9]\d*)\/feedback$/.exec(url.pathname);
+  if (!match||!Number.isSafeInteger(Number(match[1]))) throw new HttpError(404,'not_found');
+  const body=await readBody(request);
+  if (!['will_review','need_help','dismissed'].includes(body.code)||typeof (body.text??'')!=='string'||(body.text??'').length>500) throw new HttpError(400,'invalid_goal_feedback');
+  sendJson(response,200,await dailyReportStore('POST',{action:'feedback',driverId:user.driver_id,actorId:user.user_id,goalId:Number(match[1]),code:body.code,text:body.text??''}));
+}
+async function handleDailyReportNotifications(request,response,url,ctx) {
+  const user=requireVerifiedDriver(ctx.principal);
+  sendJson(response,200,await dailyReportStore('GET',{kind:'notifications',driver_id:user.driver_id,user_id:user.user_id}));
+}
+
+const driverProjectionRead = (table, query) => dbRequest("list_resource", "GET", table, { query, headers: { Prefer: "count=exact" } });
+const projectionFail = (status, code) => { throw new HttpError(status, code); };
+async function handleDriverActionCenter(request, response, url, ctx) {
+  const user = requireVerifiedDriver(ctx.principal);
+  sendJson(response, 200, await actionCenter({ driverId: user.driver_id, read: driverProjectionRead, fail: projectionFail, params: url.searchParams }));
+}
+async function handleDriverScoreComparison(request, response, url, ctx) {
+  const user = requireVerifiedDriver(ctx.principal);
+  sendJson(response, 200, await scoreComparison({ driverId: user.driver_id, read: driverProjectionRead, fail: projectionFail, params: url.searchParams }));
+}
+async function handleDriverInterventionView(request, response, url, ctx) {
+  const user = requireVerifiedDriver(ctx.principal), id = url.searchParams.get("id") || "";
+  if (!/^[\w:.,-]{1,100}$/.test(id)) throw new HttpError(400, "invalid_intervention_id");
+  const row = await loadIntervention(id, user.driver_id);
+  if (!["sent", "read", "replied", "closed"].includes(row.status) || !row.sent_at) throw new HttpError(404, "not_found");
+  let alert = null;
+  if (row.alert_id) alert = (await dbRequest("list_resource", "GET", "alerts", { query: { alert_id: `eq.${row.alert_id}`, driver_id: `eq.${user.driver_id}`, select: "alert_id", limit: 1 } })).data?.[0] || null;
+  const safe = Object.fromEntries(["intervention_id", "sent_text", "sent_at", "read_at", "reply_text", "replied_at", "status"].map(k => [k, row[k] ?? null]));
+  sendJson(response, 200, { ...safe, alert_id: alert?.alert_id || null });
+}
+
+async function handleDriverRiskCenter(request, response, url, ctx) {
+  const user = requireVerifiedDriver(ctx.principal);
+  const date = url.searchParams.get("date") || new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(Date.parse(date)) || new Date(date).toISOString().slice(0, 10) !== date) throw new HttpError(400, "invalid_date");
+  const pageNumber = (key, fallback, max) => {
+    const raw = url.searchParams.get(key);
+    if (raw === null) return fallback;
+    if (!/^\d+$/.test(raw) || !Number.isSafeInteger(Number(raw)) || Number(raw) > max) throw new HttpError(400, "invalid_pagination");
+    return Number(raw);
+  };
+  const limit = pageNumber("limit", 100, 100);
+  if (limit < 1) throw new HttpError(400, "invalid_pagination");
+  const eventsOffset = pageNumber("events_offset", 0, 1000000), alertsOffset = pageNumber("alerts_offset", 0, 1000000);
+  const start = new Date(date + "T00:00:00+08:00");
+  const end = new Date(start.getTime() + 86400000);
+  const [events, alerts, score, latest] = await Promise.all([
+    dbRequest("list_resource", "GET", "replay_events", { query: { driver_id: `eq.${user.driver_id}`, replay_date: `eq.${date}`, select: "event_id,event_time,event_type,event_name,speed_kmh,dimension,replay_date,is_replay,source_version", order: "event_time.asc,event_id.asc", limit: limit + 1, offset: eventsOffset } }),
+    dbRequest("list_resource", "GET", "alerts", { query: { driver_id: `eq.${user.driver_id}`, and: `(occurred_at.gte.${start.toISOString()},occurred_at.lt.${end.toISOString()})`, select: "alert_id,rule_code,evidence_id,occurred_at,status,is_replay", order: "occurred_at.desc,alert_id.desc", limit: limit + 1, offset: alertsOffset } }),
+    listResource(ctx.principal, "my.score", new URL("http://local/?limit=1")),
+    dbRequest("list_resource", "GET", "replay_events", { query: { driver_id: `eq.${user.driver_id}`, select: "replay_date", order: "replay_date.desc", limit: 1 } }),
+  ]);
+  const rows = events.data || [], ars = alerts.data || [];
+  sendJson(response, 200, { date, timezone: "Asia/Shanghai", source_type: "replay", queried_at: nowIso(), latest_replay_date: latest.data?.[0]?.replay_date || null, snapshot: score.rows[0] || null, events: rows.slice(0, limit), alerts: ars.slice(0, limit), pagination: { limit, events_offset: eventsOffset, alerts_offset: alertsOffset, events_has_more: rows.length > limit, alerts_has_more: ars.length > limit }, truncated: rows.length > limit || ars.length > limit, note: "历史回放记录与人工告警分开展示；预测是未来40天概率，不是当天事故事实。无记录不等于零风险。" });
+}
+
+async function handleDriverEvidence(request, response, url, ctx) {
+  const user = requireVerifiedDriver(ctx.principal);
+  const kind = url.searchParams.get("kind"), id = url.searchParams.get("id") || "";
+  const definitions = {
+    event: ["replay_events", "event_id", "event_id,event_time,event_type,event_name,speed_kmh,dimension,replay_date,is_replay,source_version"],
+    alert: ["alerts", "alert_id", "alert_id,gpsno,rule_code,evidence_id,occurred_at,status,is_replay"],
+    score: ["score_snapshots", "score_id", "score_id,gpsno,safety_score,risk_level,as_of_date,window_start,confidence_level,source_version,primary_risk_dimension,history_contribution,fatigue_distraction_contribution,driving_stability_contribution,road_rule_contribution,management_contribution,imu_evidence_contribution"],
+    score_history: ["score_history", "score_id", "score_id,gpsno,safety_score,risk_level,as_of_date,confidence_level,source_version,history_contribution,fatigue_distraction_contribution,driving_stability_contribution,road_rule_contribution,management_contribution,imu_evidence_contribution"],
+  };
+  const def = Object.hasOwn(definitions, kind) ? definitions[kind] : null;
+  const rawOffset = url.searchParams.get("offset") || "0";
+  if (!def || !/^[\w:.,-]{1,100}$/.test(id) || !/^\d+$/.test(rawOffset) || Number(rawOffset) > 1000000) throw new HttpError(400, "invalid_evidence_request");
+  const offset = Number(rawOffset);
+  const r = await dbRequest("list_resource", "GET", def[0], { query: { [def[1]]: `eq.${id}`, driver_id: `eq.${user.driver_id}`, select: def[2], limit: 1 } });
+  const record = r.data?.[0];
+  if (!record) throw new HttpError(404, "not_found");
+  let linked = null, linkedKind = null, ledger = [], ledgerStatus = "not_applicable", hasMore = false;
+  if (kind === "alert" && record.evidence_id) {
+    const queueSource = [DUAL_RULE, DATA_RULE].includes(record.rule_code);
+    const ev = queueSource ? { data: [] } : await dbRequest("list_resource", "GET", "replay_events", { query: { event_id: `eq.${record.evidence_id}`, driver_id: `eq.${user.driver_id}`, select: definitions.event[2], limit: 1 } });
+    linked = ev.data?.[0] || null; linkedKind = linked ? "event" : null;
+    // Queue evidence is shown only through an owned alert and its exact vehicle/date, never arbitrary IDs.
+    if (queueSource && record.gpsno && record.occurred_at) {
+      const day = /^\d{4}-\d{2}-\d{2}$/.test(record.occurred_at) ? record.occurred_at : Number.isFinite(Date.parse(record.occurred_at)) ? new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(record.occurred_at)) : null;
+      if (day) {
+        const q = await dbRequest("list_resource", "GET", "review_queue", { query: { queue_id: `eq.${record.evidence_id}`, gpsno: `eq.${record.gpsno}`, as_of_date: `eq.${day}`, select: "queue_id,as_of_date,safety_score,risk_level,forecast_40d_risk_prob,confidence_level,source_version", limit: 1 } });
+        linked = q.data?.[0] || null; linkedKind = linked ? "queue" : null;
+      }
+    }
+  }
+  if (["score", "score_history"].includes(kind)) {
+    ledgerStatus = "unavailable";
+    if (record.gpsno && record.as_of_date) {
+      const ls = await dbRequest("list_resource", "GET", "deduction_ledger", { query: { gpsno: `eq.${record.gpsno}`, as_of_date: `eq.${record.as_of_date}`, select: "ledger_id,event_type,dimension,event_count,allocated_points,dimension_points,allocation_rule,as_of_date,source_version", order: "ledger_id.asc", offset, limit: 21 } });
+      ledger = (ls.data || []).slice(0, 20); hasMore = (ls.data || []).length > 20;
+      ledgerStatus = ledger.length ? "available" : "no_records";
+    }
+  }
+  // Vehicle keys are used internally for authorization, not exposed as a general lookup capability.
+  const { gpsno, ...safeRecord } = record;
+  sendJson(response, 200, { kind, record: safeRecord, linked, linked_kind: linkedKind, ledger, ledger_status: ledgerStatus, offset, has_more: hasMore, queried_at: nowIso(), limitations: "只展示本人记录及其精确关联。台账为该评价日期的扣分分摊，不是单事件因果解释；来源版本可能不同，未核验时不能据此重算历史评分。无台账不等于零风险。" });
+}
+
+// Compare-and-set: only a successful transition may audit/notify. Stale drafts cannot overwrite a submission.
+async function hostTaskRetryNotification(request, response, url, ctx, taskId) {
+  requireUser(ctx.principal, "assign.training");
+  const row = await loadTask(taskId, null);
+  await assertInScope(ctx.principal, { driverId: row.driver_id });
+  const body = await readBody(request);
+  if (!["assigned", "submitted"].includes(body.kind)) throw new HttpError(400, "invalid_notification_kind");
+  const receipt = await taskNotification(row, body.kind);
+  const auditId = await appendAudit(ctx.principal, "training.notification_retry", "training_task", taskId, null, receipt.state, ctx.requestId, null, { kind: body.kind, notification_id: receipt.notification_id });
+  sendJson(response, 200, { ok: true, task_id: taskId, notification: receipt, audit_id: auditId });
+}
+
+// ===== R24：TR06 AI 辅助摘要（受控、只读、结构化、可点击回源；不改业务状态） =====
+// ===== R26：AI04 管理动作并排预演（只读组装卡片事实底座 + 复用对话侧 action_preplan；零业务写） =====
+async function hostLearningReport(request, response, url, ctx) {
+  const user = requireVerifiedDriver(ctx.principal);
+  const taskId = String(url.searchParams.get("task_id") || "");
+  if (!/^[\w:,.-]{1,80}$/.test(taskId)) throw new HttpError(400, "invalid_task_id");
+  const task = await loadTask(taskId, user.driver_id);
+  const learning = await taskLearning(task);
+  const courseResult = await dbRequest("get_course_row", "GET", "training_courses", { query: { course_id: `eq.${task.course_id}`, select: "course_id,title,content_status,version_no,source_version,completion_requirement", limit: 1 } });
+  const course = learning.course_snapshot || courseResult.data?.[0] || null;
+  sendJson(response, 200, { task_id: task.task_id, course: course ? { course_id: course.course_id, title: course.title, completion_requirement: course.completion_requirement, version_no: course.version_no ?? null, source_version: course.source_version || null } : null, goal: task.goal || null, status: task.status, learning_record: task.learning_record ?? null, feedback: task.feedback ?? null, review_note: task.review_note ?? null, submitted_at: task.submitted_at || null, reviewed_at: task.reviewed_at || null, alert_id: task.alert_id || null, conclusion: task.review_note ? "以下是安全员已记录的复核意见，不等于事故风险降低的证明。" : "尚无人工复核结论。", limitations: "本汇总仅整理来源课程、本人学习记录及已保存的流程事实，不生成专业测验分数，不推断培训效果，不改安全评分。", generated_at: nowIso() });
+}
+
+
+// ---------- Section: score review requests (EV05) ----------
+// 契约 app_tables.json：状态 submitted→checking→awaiting_data_owner→answered→closed；
+// 本模块只读取快照/台账做核查展示，任何接口不写评分/概率/等级/六维/旧快照（源数据问题只能转数据负责人走正式版本化流程）。
+
+const DUAL_HOST={'driver:center':handleDriverActionCenter,'driver:comparison':handleDriverScoreComparison,'driver:intervention':handleDriverInterventionView,'driver:risk':handleDriverRiskCenter,'driver:evidence':handleDriverEvidence,'driver:today':handleDailyReportToday,'driver:history':handleDailyReportHistory,'driver:notifications':handleDailyReportNotifications,'driver:goals':handleDailySafetyGoals,'driver:adminData':handleDailyReportJobs,'driver:adminRun':handleDailyReportRun,'driver:feedback':handleDailyGoalFeedback,'driver:adminDetail':hostAdminDailyDetail,'driver:reportEvidence':hostAdminReportEvidence,'driver:reportSettings':hostReportSettings,'driver:saveReportSettings':hostSaveReportSettings,'learning:report':hostLearningReport,'learning:retry':hostTaskRetryNotification};
+async function handleDual(r,s,u,c,service,action,id){ if(process.env.APP_DATA_MODE==='full') return handleIntegrated(r,s,u,c,service,action,id); const fn=DUAL_HOST[service+':'+action]; if(!fn) throw new HttpError(503,'integration_action_not_mapped'); return fn(r,s,u,c,id); }
+async function hostAdminDailyDetail(r,s,u,c){ requireUser(c.principal); const id=String(new URL(r.url||'/','http://x').searchParams.get('id')||''); if(!/^[1-9]\d*$/.test(id))throw new HttpError(400,'invalid_report_id'); const row=(await dbRequest('dsr_q','GET','daily_safety_reports',{query:{id:'eq.'+id,select:'id,driver_id,report_version,report_json,published_at',limit:1}})).data?.[0]; if(!row)throw new HttpError(404,'not_found'); await assertInScope(c.principal,{driverId:row.driver_id}); sendJson(s,200,{id:Number(row.id),reportVersion:Number(row.report_version),publishedAt:row.published_at,report:JSON.parse(row.report_json)}); }
+async function hostAdminReportEvidence(r,s,u,c){ requireUser(c.principal); const out=await evidenceCheckCore(String(new URL(r.url||'/','http://x').searchParams.get('ref')||''),c); return sendJson(s,out.code,out.payload); }
+async function hostReportSettings(r,s,u,c){ requireUser(c.principal); sendJson(s,200,{publish_time:(process.env.IE_DAILY_REPORT_AT||'07:00'),business_timezone:'Asia/Shanghai',managed_by:'server env (hosted)'}); }
+async function hostSaveReportSettings(r,s,u,c){ requireUser(c.principal); sendJson(s,200,{ok:false,note:'宿主环境的简报发布时间由部署 env IE_DAILY_REPORT_AT 控制（默认 07:00 Asia/Shanghai）'}); }
 async function integratedRPC(service,action,p,input={}){const u=requireUser(p);if(process.env.APP_DATA_MODE!=='full')throw new HttpError(503,'full_data_required');const t=resolveDbTarget(),r=await fetch(t.url+'/internal/'+service+'-integration/'+action,{method:'POST',headers:{apikey:t.key,'content-type':'application/json'},body:JSON.stringify({...input,actor:{id:u.user_id}})}),data=await r.json();if(!r.ok)throw new HttpError(r.status,data.error||'driver_service_failed');return data;}
 async function handleIntegrated(request,response,url,ctx,service,action,id){const input=request.method==='GET'?Object.fromEntries(url.searchParams):await readBody(request);sendJson(response,200,await integratedRPC(service,action,ctx.principal,{...input,...(id?{id,task_id:id}:{})}));}
 async function handoverRPC(action,p,input={}){const u=requireUser(p);if(!['safety_admin','safety_officer'].includes(u.role))throw new HttpError(403,'handover_forbidden');if(process.env.APP_DATA_MODE!=='full')throw new HttpError(503,'handover_local_service_required');const t=resolveDbTarget(),r=await fetch(t.url+'/internal/handover/'+action,{method:'POST',headers:{apikey:t.key,'content-type':'application/json'},body:JSON.stringify({...input,actor:{id:u.user_id}})}),data=await r.json();if(!r.ok)throw new HttpError(r.status,data.error||'handover_failed');return data;}
@@ -3979,16 +4394,16 @@ const API_ROUTES = [
 
 
 for(const [method,path,action] of [
- ['GET','/api/driver/action-center','center'],['GET','/api/driver/score-comparison','comparison'],['GET','/api/driver/intervention','intervention'],['GET','/api/driver/risk-center','risk'],['GET','/api/driver/evidence','evidence'],['GET','/api/driver/reports/today','today'],['GET','/api/driver/reports/history','history'],['GET','/api/driver/notifications','notifications'],['GET','/api/driver/safety-goals','goals'],['GET','/api/admin/daily-reports/jobs','adminData'],['GET','/api/admin/daily-reports/settings','reportSettings'],['POST','/api/admin/daily-reports/settings','saveReportSettings'],['POST','/api/admin/daily-reports/run','adminRun'],['GET','/api/admin/daily-reports/detail','adminDetail'],['GET','/api/admin/daily-reports/evidence','reportEvidence']])API_ROUTES.push({method,path,needAuth:true,handler:(r,s,u,c)=>handleIntegrated(r,s,u,c,'driver',action)});
-API_ROUTES.push({method:'GET',path:'/api/driver/learning-report',needAuth:true,handler:(r,s,u,c)=>handleIntegrated(r,s,u,c,'learning','report')});
+ ['GET','/api/driver/action-center','center'],['GET','/api/driver/score-comparison','comparison'],['GET','/api/driver/intervention','intervention'],['GET','/api/driver/risk-center','risk'],['GET','/api/driver/evidence','evidence'],['GET','/api/driver/reports/today','today'],['GET','/api/driver/reports/history','history'],['GET','/api/driver/notifications','notifications'],['GET','/api/driver/safety-goals','goals'],['GET','/api/admin/daily-reports/jobs','adminData'],['GET','/api/admin/daily-reports/settings','reportSettings'],['POST','/api/admin/daily-reports/settings','saveReportSettings'],['POST','/api/admin/daily-reports/run','adminRun'],['GET','/api/admin/daily-reports/detail','adminDetail'],['GET','/api/admin/daily-reports/evidence','reportEvidence']])API_ROUTES.push({method,path,needAuth:true,handler:(r,s,u,c)=>handleDual(r,s,u,c,'driver',action)});
+API_ROUTES.push({method:'GET',path:'/api/driver/learning-report',needAuth:true,handler:(r,s,u,c)=>handleDual(r,s,u,c,'learning','report')});
 const CASE_ROUTES = [
  {method:'GET',re:/^\/api\/training-tasks\/([^/]+)\/custom-learning$/,h:handleCustomLearning},
  {method:'POST',re:/^\/api\/training-tasks\/([^/]+)\/custom-learning$/,h:handleCustomLearning},
  {method:'POST',re:/^\/api\/training-tasks\/([^/]+)\/quiz-draft$/,h:handleQuizDraft},
- {method:'GET',re:/^\/api\/driver\/reports\/([0-9]+)$/,h:(r,s,u,c,id)=>handleIntegrated(r,s,u,c,'driver','detail',id)},
- {method:'POST',re:/^\/api\/driver\/safety-goals\/([0-9]+)\/feedback$/,h:(r,s,u,c,id)=>handleIntegrated(r,s,u,c,'driver','feedback',id)},
+ {method:'GET',re:/^\/api\/driver\/reports\/([0-9]+)$/,h:(r,s,u,c,id)=>process.env.APP_DATA_MODE==='full'?handleIntegrated(r,s,u,c,'driver','detail',id):handleDailyReportDetail(r,s,u,c)},
+ {method:'POST',re:/^\/api\/driver\/safety-goals\/([0-9]+)\/feedback$/,h:(r,s,u,c,id)=>process.env.APP_DATA_MODE==='full'?handleIntegrated(r,s,u,c,'driver','feedback',id):handleDailyGoalFeedback(r,s,u,c)},
  {method:'POST',re:/^\/api\/admin\/safety-goals\/([0-9]+)\/handle$/,h:(r,s,u,c,id)=>handleIntegrated(r,s,u,c,'driver','handleGoal',id)},
- {method:'POST',re:/^\/api\/training-tasks\/([^/]+)\/retry-notification$/,h:(r,s,u,c,id)=>handleIntegrated(r,s,u,c,'learning','retry',id)},
+ {method:'POST',re:/^\/api\/training-tasks\/([^/]+)\/retry-notification$/,h:(r,s,u,c,id)=>handleDual(r,s,u,c,'learning','retry',id)},
   {method:"GET",re:/^\/api\/training-tasks\/([^/]+)\/quiz$/,h:handleQuizView},
   {method:"POST",re:/^\/api\/training-tasks\/([^/]+)\/quiz-answer$/,h:handleQuizAnswer},
   {method:"POST",re:/^\/api\/training-tasks\/([^/]+)\/quiz-finish$/,h:handleQuizFinish},
@@ -4096,3 +4511,5 @@ const server = createServer(async (request, response) => {
 });
 
 server.listen(port, host, () => { console.log(`Crazy Logi-AI workbench server on http://${host}:${port}`); });
+setInterval(() => { void dailyTick(); }, 60000).unref?.();
+setTimeout(() => { void dailyTick(); }, 4000).unref?.();
